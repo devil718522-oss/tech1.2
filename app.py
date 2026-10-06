@@ -328,6 +328,70 @@ def final_trade_decision(s, ts):
     return "🟡 觀察", "尚未形成完整價格觸發", reasons
 
 
+
+def dual_entry_plan(x, s, ts):
+    """每檔都產生 A回檔買、B突破買、禁止追價、停損與目標。
+    價位是技術研究參考；是否執行仍由最終決策另行判斷。
+    """
+    r=x.iloc[-1]
+    close=float(r.Close)
+    atr=float(r.ATR14) if "ATR14" in x.columns and pd.notna(r.ATR14) else max(close*0.02, 0.01)
+
+    # A 回檔買點：優先使用既有回測支撐區；若不足，退回 MA10/MA20/突破位。
+    supports=[]
+    for v in [ts.get("回測區下"), ts.get("回測區上"), ts.get("右側突破"),
+              r.MA10 if "MA10" in x.columns else np.nan,
+              r.MA20 if "MA20" in x.columns else np.nan,
+              ts.get("上升切線")]:
+        if pd.notna(v) and float(v)>0:
+            supports.append(float(v))
+
+    if supports:
+        # 取最接近現價、且不高於現價約 3% 的有效支撐
+        eligible=[v for v in supports if v <= close*1.03]
+        base=max(eligible) if eligible else min(supports, key=lambda v: abs(v-close))
+    else:
+        base=close-atr
+
+    pullback_low=max(0.01, base-0.35*atr)
+    pullback_high=base+0.20*atr
+
+    # B 突破買點：沿用結構壓力；若缺失，以近20日前高作替代。
+    breakout=ts.get("右側突破")
+    if pd.isna(breakout):
+        prevhh=float(r.PrevHH20) if "PrevHH20" in x.columns and pd.notna(r.PrevHH20) else close
+        breakout=prevhh*1.002
+    breakout=float(breakout)
+
+    # 禁止追價：突破價上方 2%，超過就等回測。
+    chase_limit=breakout*1.02
+
+    # 停損：以結構停損為主，但避免停損高於回檔區。
+    stop=float(ts.get("結構停損")) if pd.notna(ts.get("結構停損")) else pullback_low-0.5*atr
+    if stop >= pullback_low:
+        stop=max(0.01, pullback_low-0.5*atr)
+
+    pattern_target=ts.get("目標價")
+    if pd.isna(pattern_target) or float(pattern_target) <= breakout:
+        pattern_target=breakout + 2.0*(breakout-stop)
+    pattern_target=float(pattern_target)
+
+    # 第一目標用突破價到型態目標的一半，至少需高於突破價。
+    first_target=breakout + 0.5*(pattern_target-breakout)
+
+    # 兩套方案各自風報比
+    pullback_mid=(pullback_low+pullback_high)/2
+    rr_a=(pattern_target-pullback_mid)/(pullback_mid-stop) if pullback_mid>stop and pattern_target>pullback_mid else np.nan
+    rr_b=(pattern_target-breakout)/(breakout-stop) if breakout>stop and pattern_target>breakout else np.nan
+
+    return {
+        "A回檔下":pullback_low, "A回檔上":pullback_high,
+        "B突破":breakout, "禁止追價":chase_limit,
+        "計畫停損":stop, "第一目標2":first_target, "型態目標2":pattern_target,
+        "A風報比":rr_a, "B風報比":rr_b
+    }
+
+
 def grade(v):
     return "S" if v >= 85 else "A" if v >= 75 else "B" if v >= 65 else "C"
 
@@ -371,7 +435,7 @@ else:
     raw = st.text_area("輸入股票代號｜一行一個", "2376\n3481\n2330", height=180)
     stocks = [s.strip() for s in raw.replace(",", "\n").splitlines() if s.strip().isdigit()]
 
-if st.button("📡 啟動 V1.4.3 一眼看懂進場版", type="primary", use_container_width=True):
+if st.button("📡 啟動 V1.5 雙買點交易計畫版", type="primary", use_container_width=True):
     end = date.today()
     start = end - timedelta(days=history_days)
     rows, details, datasets = [], {}, {}
@@ -387,6 +451,7 @@ if st.button("📡 啟動 V1.4.3 一眼看懂進場版", type="primary", use_con
                 raise RuntimeError("無法計算完整技術指標")
             ts = technical_structure(x)
             final_state, final_action, final_notes = final_trade_decision(s, ts)
+            plan = dual_entry_plan(x, s, ts)
             rows.append({
                 "代號": sid, "品質分": s["品質分"], "級別": grade(s["品質分"]),
                 "進場分": s["進場分"], "狀態": s["狀態"], "收盤": s["收盤"],
@@ -397,7 +462,12 @@ if st.button("📡 啟動 V1.4.3 一眼看懂進場版", type="primary", use_con
                 "左側觸發": ts["左側觸發"], "右側突破": ts["右側突破"],
                 "進場區下": ts["進場區下"], "進場區上": ts["進場區上"],
                 "結構停損": ts["結構停損"], "第一目標": ts["第一目標"],
-                "目標價": ts["目標價"], "風報比": ts["風報比"]
+                "目標價": ts["目標價"], "風報比": ts["風報比"],
+                "A回檔下": plan["A回檔下"], "A回檔上": plan["A回檔上"],
+                "B突破": plan["B突破"], "禁止追價": plan["禁止追價"],
+                "計畫停損": plan["計畫停損"], "第一目標2": plan["第一目標2"],
+                "型態目標2": plan["型態目標2"],
+                "A風報比": plan["A風報比"], "B風報比": plan["B風報比"]
             })
             s["structure"] = ts
             details[sid] = s
@@ -428,77 +498,67 @@ if "radar_out" in st.session_state:
     details = st.session_state["radar_details"]
     datasets = st.session_state["radar_datasets"]
 
-    st.header("🚦 現在能不能買？")
-    st.caption("先看結論，再看技術細節。只有「🟢 可以進場」才是目前符合完整規則的標的。")
+    st.header("🎯 每檔都有明確買點")
+    st.caption("A＝回檔買；B＝突破買。『現在能不能買』與『未來買點在哪』分開顯示。")
 
     priority={"🟢 可進場":0,"🟡 等待突破":1,"🟡 等量確認":2,"🔵 等待回測":3,"🟡 觀察":4,"🔴 不進場":5}
     cards=out.copy()
     cards["_p"]=cards["最終決策"].map(priority).fillna(9)
     cards=cards.sort_values(["_p","品質分","技術共振"],ascending=[True,False,False])
 
-    for _,row in cards.head(12).iterrows():
+    for _,row in cards.head(15).iterrows():
         sid=row["代號"]
         decision=row["最終決策"]
 
         if decision=="🟢 可進場":
-            title=f"🟢 {sid}｜可以進場"
-            headline=f'建議進場：{row["進場區下"]:.2f} ～ {row["進場區上"]:.2f} 元'
-        elif decision=="🟡 等待突破":
-            title=f"🟡 {sid}｜還不能買"
-            headline=f'等待突破：{row["右側突破"]:.2f} 元'
-        elif decision=="🟡 等量確認":
-            title=f"🟡 {sid}｜價格到了，等成交量"
-            headline=f'現價 {row["收盤"]:.2f} 元；量比 {row["量比"]:.2f}，量能確認後再評估'
-        elif decision=="🔵 等待回測":
-            title=f"🔵 {sid}｜不要追價"
-            headline=f'等待回測：{row["進場區下"]:.2f} ～ {row["進場區上"]:.2f} 元'
+            verdict="🟢 現在可評估進場"
         elif decision=="🔴 不進場":
-            title=f"🔴 {sid}｜目前不進場"
-            headline=str(row["現在該做"])
+            verdict="🔴 現在不買"
+        elif decision=="🔵 等待回測":
+            verdict="🔵 現在不追，等回檔"
         else:
-            title=f"🟡 {sid}｜先觀察"
-            headline=str(row["現在該做"])
+            verdict="🟡 現在先等"
 
         with st.container(border=True):
-            st.subheader(title)
-            st.markdown(f"### {headline}")
+            st.subheader(f"{sid}｜{verdict}")
+            st.markdown(
+                f'### A｜回檔買：**{row["A回檔下"]:.2f} ～ {row["A回檔上"]:.2f} 元**  \n'
+                f'### B｜突破買：**突破 {row["B突破"]:.2f} 元＋量能確認**'
+            )
+            st.write(f'**禁止追價：超過 {row["禁止追價"]:.2f} 元不追**')
+
             a,b,c,d=st.columns(4)
             a.metric("現價",f'{row["收盤"]:.2f}')
-            b.metric("停損","-" if pd.isna(row["結構停損"]) else f'{row["結構停損"]:.2f}')
-            c.metric("第一目標","-" if pd.isna(row["第一目標"]) else f'{row["第一目標"]:.2f}')
-            d.metric("型態目標","-" if pd.isna(row["目標價"]) else f'{row["目標價"]:.2f}')
+            b.metric("停損",f'{row["計畫停損"]:.2f}')
+            c.metric("第一目標",f'{row["第一目標2"]:.2f}')
+            d.metric("型態目標",f'{row["型態目標2"]:.2f}')
 
             if decision=="🔴 不進場":
-                st.error(f'不進場原因：{row["現在該做"]}')
+                st.error(f'目前不買原因：{row["現在該做"]}。上面的 A/B 價位是「下一次觀察計畫」，不是現在的買進指令。')
             elif decision=="🟢 可進場":
-                st.success(
-                    f'進場 {row["進場區下"]:.2f}～{row["進場區上"]:.2f}｜'
-                    f'停損 {row["結構停損"]:.2f}｜'
-                    f'風報比 {"-" if pd.isna(row["風報比"]) else f"1:{row["風報比"]:.2f}"}'
-                )
-            elif decision=="🟡 等待突破":
-                st.warning(f'現在先不買；突破 {row["右側突破"]:.2f} 元後，再看量能是否確認。')
+                st.success("目前完整條件通過；仍以進場區、量價確認與停損紀律執行。")
             elif decision=="🔵 等待回測":
-                st.info(f'已突破但不追高；回到 {row["進場區下"]:.2f}～{row["進場區上"]:.2f} 再重新評估。')
-            elif decision=="🟡 等量確認":
-                st.warning("價格已進入合理區，但成交量尚未達條件。")
+                st.info(f'目前不要追價；優先等 A 回檔區 {row["A回檔下"]:.2f}～{row["A回檔上"]:.2f}。')
+            else:
+                st.warning(f'目前先等；可觀察 A 回檔區，或 B 突破 {row["B突破"]:.2f} 後的量價確認。')
 
             st.caption(
-                f'品質 {row["品質分"]:.0f}/100｜共振 {row["技術共振"]}/8｜'
-                f'量比 {row["量比"]:.2f}｜'
-                f'風報比 {"-" if pd.isna(row["風報比"]) else f"1:{row["風報比"]:.2f}"}'
+                f'品質 {row["品質分"]:.0f}/100｜共振 {row["技術共振"]}/8｜量比 {row["量比"]:.2f}｜'
+                f'A風報比 {"-" if pd.isna(row["A風報比"]) else f"1:{row["A風報比"]:.2f}"}｜'
+                f'B風報比 {"-" if pd.isna(row["B風報比"]) else f"1:{row["B風報比"]:.2f}"}'
             )
 
-    with st.expander("🔎 查看技術細節（進階）"):
+    with st.expander("🔎 技術細節"):
         detail_cols=["代號","最終決策","收盤","品質分","技術共振","量比",
-                     "右側突破","進場區下","進場區上","結構停損","第一目標","目標價","風報比"]
+                     "A回檔下","A回檔上","B突破","禁止追價","計畫停損",
+                     "第一目標2","型態目標2","A風報比","B風報比"]
         detail=out[detail_cols].copy()
-        for c in ["收盤","右側突破","進場區下","進場區上","結構停損","第一目標","目標價"]:
+        for c in ["收盤","A回檔下","A回檔上","B突破","禁止追價","計畫停損","第一目標2","型態目標2"]:
             detail[c]=detail[c].map(lambda v:"-" if pd.isna(v) else f"{v:.2f}")
         detail["量比"]=detail["量比"].map(lambda v:"-" if pd.isna(v) else f"{v:.2f}")
-        detail["風報比"]=detail["風報比"].map(lambda v:"-" if pd.isna(v) else f"1:{v:.2f}")
+        detail["A風報比"]=detail["A風報比"].map(lambda v:"-" if pd.isna(v) else f"1:{v:.2f}")
+        detail["B風報比"]=detail["B風報比"].map(lambda v:"-" if pd.isna(v) else f"1:{v:.2f}")
         st.dataframe(detail,use_container_width=True,hide_index=True)
-        st.caption("技術結構、品質分與共振用來解釋決策；不要把單一綠色結構訊號視為買進訊號。")
 
     st.divider()
     st.header("🧪 歷史驗證｜不偷看未來")
