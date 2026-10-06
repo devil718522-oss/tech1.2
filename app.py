@@ -455,14 +455,14 @@ if "radar_out" in st.session_state:
         st.caption(f'20日平均 MFE：{bt["MFE20"].mean():.2%}｜平均 MAE：{bt["MAE20"].mean():.2%}')
         st.download_button("下載歷史驗證 CSV", bt.to_csv(index=False).encode("utf-8-sig"), "v1_3_backtest.csv", "text/csv")
 
-st.caption("V1.7｜全市場快照＋技術結構選股，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
+st.caption("V1.8｜官方免費市場海選＋FinMind技術分析，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
 
 
 # ============================================================
 # V1.6 全市場自動選股雷達
 # ============================================================
 st.divider()
-st.header("🤖 V1.7｜全市場快照引擎")
+st.header("🤖 V1.8｜官方免費市場資料引擎")
 st.caption("自動取得上市櫃股票名單 → 快速篩選 → 完整技術分析。為避免 API 額度與手機逾時，採兩階段掃描。")
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -567,100 +567,148 @@ def v162_probe_price(stock_id="2330"):
     except Exception as e:
         return False,None,f"{type(e).__name__}: {e}",0
 
-st.subheader("⚡ V1.7｜全市場快照引擎")
-st.caption("先用一次全市場即時快照做流動性篩選，再只對少量候選抓歷史 K 線。避免 120 檔逐檔硬打 API。")
+st.subheader("🆓 V1.8｜官方免費市場資料引擎")
+st.caption("第一階段改用 TWSE／TPEx 官方免費市場資料海選；FinMind 只負責少量候選的歷史 K 線。")
 
-with st.expander("⚙️ V1.7 掃描設定",expanded=False):
-    v17_minp=st.number_input("最低股價",1.0,1000.0,10.0,1.0,key="v17minp")
-    v17_maxp=st.number_input("最高股價",1.0,5000.0,800.0,10.0,key="v17maxp")
-    v17_minvol=st.number_input("當日最低成交量（張）",0,200000,1000,100,key="v17minvol")
-    v17_pool=st.slider("快照後留下幾檔做歷史技術分析",10,50,25,5,key="v17pool")
-    v17_final=st.slider("最後最多顯示候選",5,30,15,5,key="v17final")
+with st.expander("⚙️ V1.8 掃描設定",expanded=False):
+    v18_minp=st.number_input("最低股價",1.0,1000.0,10.0,1.0,key="v18minp")
+    v18_maxp=st.number_input("最高股價",1.0,5000.0,800.0,10.0,key="v18maxp")
+    v18_minvol=st.number_input("最低成交量（張）",0,200000,1000,100,key="v18minvol")
+    v18_pool=st.slider("送入歷史技術分析的檔數",10,40,20,5,key="v18pool")
+    v18_final=st.slider("最後最多顯示候選",5,25,15,5,key="v18final")
+
+def _num(x):
+    return pd.to_numeric(x.astype(str).str.replace(",","",regex=False).str.replace("--","",regex=False),errors="coerce")
 
 @st.cache_data(ttl=300,show_spinner=False)
-def v17_snapshot():
-    url="https://api.finmindtrade.com/api/v4/taiwan_stock_tick_snapshot"
-    r=requests.get(url,params={"data_id":""},timeout=30)
-    try:
-        js=r.json()
-    except Exception:
-        raise RuntimeError(f"快照 API HTTP {r.status_code}｜非 JSON：{r.text[:200]}")
-    if r.status_code!=200 or js.get("status") not in (200,None):
-        raise RuntimeError(f"快照 API HTTP {r.status_code}｜status={js.get('status')}｜{js.get('msg','')}")
-    d=pd.DataFrame(js.get("data") or [])
-    if d.empty: raise RuntimeError("快照 API 成功回應，但沒有行情資料")
+def v18_twse():
+    url="https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+    r=requests.get(url,timeout=30,headers={"User-Agent":"Mozilla/5.0"})
+    if r.status_code!=200: raise RuntimeError(f"TWSE HTTP {r.status_code}")
+    d=pd.DataFrame(r.json())
+    if d.empty: raise RuntimeError("TWSE 回傳空資料")
+    # TWSE OpenAPI: Code, Name, ClosingPrice, TradeVolume, TradeValue...
+    ren={"Code":"stock_id","Name":"stock_name","ClosingPrice":"close",
+         "TradeVolume":"volume","TradeValue":"amount"}
+    d=d.rename(columns={k:v for k,v in ren.items() if k in d.columns})
+    need={"stock_id","close","volume"}
+    if not need.issubset(d.columns): raise RuntimeError(f"TWSE 欄位異常：{list(d.columns)[:12]}")
+    d["market"]="上市"
     return d
 
-def v17_num(s):
-    return pd.to_numeric(s,errors="coerce")
+@st.cache_data(ttl=300,show_spinner=False)
+def v18_tpex():
+    # TPEx OpenAPI 有不同版本欄位命名；依序嘗試官方日行情端點。
+    urls=[
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
+    ]
+    last=""
+    for url in urls:
+        try:
+            r=requests.get(url,timeout=30,headers={"User-Agent":"Mozilla/5.0"})
+            if r.status_code!=200:
+                last=f"HTTP {r.status_code}"; continue
+            d=pd.DataFrame(r.json())
+            if d.empty: last="空資料"; continue
+            # 彈性辨識中英文欄位
+            aliases={
+                "stock_id":["SecuritiesCompanyCode","Code","SecuritiesCode","股票代號","證券代號"],
+                "stock_name":["CompanyName","Name","Company","股票名稱","證券名稱"],
+                "close":["Close","ClosingPrice","收盤價","收盤"],
+                "volume":["TradingShares","TradeVolume","成交股數","成交量"],
+                "amount":["TransactionAmount","TradeValue","成交金額"]
+            }
+            out=pd.DataFrame()
+            for dst,cands in aliases.items():
+                for c in cands:
+                    if c in d.columns:
+                        out[dst]=d[c]; break
+            if {"stock_id","close","volume"}.issubset(out.columns):
+                if "stock_name" not in out: out["stock_name"]=""
+                if "amount" not in out: out["amount"]=np.nan
+                out["market"]="上櫃"
+                return out
+            last=f"欄位：{list(d.columns)[:15]}"
+        except Exception as e:
+            last=str(e)
+    raise RuntimeError(f"TPEx 官方 OpenAPI 無法解析：{last}")
 
-def v17_prepare_snapshot(d,universe,minp,maxp,minvol):
+def v18_clean(d):
     x=d.copy()
-    # 官方快照欄位
-    if "stock_id" not in x.columns or "close" not in x.columns:
-        raise RuntimeError("快照資料缺少 stock_id / close 欄位")
-    x["stock_id"]=x["stock_id"].astype(str)
+    x["stock_id"]=x["stock_id"].astype(str).str.strip()
     x=x[x["stock_id"].str.fullmatch(r"\d{4}",na=False)]
-    x["close"]=v17_num(x["close"])
-    volcol="total_volume" if "total_volume" in x.columns else ("volume" if "volume" in x.columns else None)
-    if not volcol: raise RuntimeError("快照資料缺少成交量欄位")
-    x["成交量_張"]=v17_num(x[volcol])/1000.0
-    if "change_rate" in x.columns: x["漲跌幅"]=v17_num(x["change_rate"])
-    else: x["漲跌幅"]=np.nan
-    if "total_amount" in x.columns: x["成交額"]=v17_num(x["total_amount"])
-    elif "amount" in x.columns: x["成交額"]=v17_num(x["amount"])
-    else: x["成交額"]=x["close"]*v17_num(x[volcol])
+    x["close"]=_num(x["close"])
+    x["volume"]=_num(x["volume"])
+    if "amount" not in x: x["amount"]=np.nan
+    x["amount"]=_num(x["amount"])
+    x["成交量(張)"]=x["volume"]/1000.0
+    x["成交額"]=x["amount"].fillna(x["close"]*x["volume"])
+    return x.dropna(subset=["close","volume"])
 
-    # 與普通股清單 inner join，自動排掉 ETF / 指數等非普通股
-    u=universe.copy()
-    u["stock_id"]=u["stock_id"].astype(str)
-    keep=["stock_id"]+[c for c in ["stock_name","industry_category","type"] if c in u.columns]
-    x=x.merge(u[keep].drop_duplicates("stock_id"),on="stock_id",how="inner")
-    x=x[(x["close"]>=minp)&(x["close"]<=maxp)&(x["成交量_張"]>=minvol)]
-    x=x.sort_values(["成交額","成交量_張"],ascending=False)
-    return x
-
-def v17_history(sid,days=420):
+def v18_history(sid,days=420):
     end=pd.Timestamp.today().normalize()
     start=end-pd.Timedelta(days=days)
     return api_get("TaiwanStockPrice",sid,start.strftime("%Y-%m-%d"),end.strftime("%Y-%m-%d"))
 
-if st.button("🚀 啟動 V1.7 全市場自動選股",type="primary",use_container_width=True,key="v17go"):
+if st.button("🚀 啟動 V1.8 免費全市場選股",type="primary",use_container_width=True,key="v18go"):
     try:
-        uni=v16_stock_universe()
-        snap=v17_snapshot()
-        pool=v17_prepare_snapshot(snap,uni,v17_minp,v17_maxp,v17_minvol)
-        st.success(f"全市場快照成功：{len(snap)} 筆｜符合普通股＋價量條件：{len(pool)} 檔")
-        if pool.empty:
-            st.warning("快照正常，但目前沒有股票符合你設定的股價／成交量門檻。")
+        source_msgs=[]; frames=[]
+        try:
+            a=v18_clean(v18_twse()); frames.append(a); source_msgs.append(f"TWSE上市 {len(a)}")
+        except Exception as e:
+            source_msgs.append(f"TWSE失敗：{e}")
+        try:
+            b=v18_clean(v18_tpex()); frames.append(b); source_msgs.append(f"TPEx上櫃 {len(b)}")
+        except Exception as e:
+            source_msgs.append(f"TPEx失敗：{e}")
+
+        if not frames:
+            st.error("TWSE／TPEx 官方資料都無法取得。")
+            st.code("\n".join(source_msgs))
             st.stop()
 
-        # 只取成交額前段少量股票，歷史 K 線請求由 120 次降到 10~50 次。
-        shortlist=pool.head(v17_pool).copy()
-        st.write(f"第二階段只分析流動性前段 **{len(shortlist)} 檔**，大幅降低 API 請求。")
+        snap=pd.concat(frames,ignore_index=True)
+        # 普通股：四位純數字；再用 FinMind universe 名單 inner join 強化排除 ETF/ETN。
+        try:
+            uni=v16_stock_universe().copy()
+            uni["stock_id"]=uni["stock_id"].astype(str)
+            keep=["stock_id"]+[c for c in ["industry_category"] if c in uni.columns]
+            snap=snap.merge(uni[keep].drop_duplicates("stock_id"),on="stock_id",how="inner")
+        except Exception:
+            pass
+
+        pool=snap[(snap["close"]>=v18_minp)&(snap["close"]<=v18_maxp)&
+                  (snap["成交量(張)"]>=v18_minvol)].copy()
+        pool=pool.sort_values(["成交額","成交量(張)"],ascending=False)
+        st.success("｜".join(source_msgs))
+        st.write(f"官方市場資料合計 **{len(snap)} 檔**｜價量海選後 **{len(pool)} 檔**")
+
+        if pool.empty:
+            st.warning("官方資料正常，但沒有股票符合目前股價／成交量門檻。")
+            st.stop()
+
+        shortlist=pool.head(v18_pool).copy()
+        st.info(f"只把成交額前段 {len(shortlist)} 檔送入 FinMind 歷史 K 線，避免大量 API 請求。")
         results=[]; errors=[]
-        bar=st.progress(0,text="第二階段：歷史 K 線＋完整技術結構")
+        bar=st.progress(0,text="歷史 K 線＋完整技術結構")
         for i,row in shortlist.reset_index(drop=True).iterrows():
             sid=str(row["stock_id"])
             try:
-                d=v17_history(sid)
+                d=v18_history(sid)
                 if d.empty or len(d)<65:
                     errors.append(f"{sid}: 歷史資料不足")
                 else:
                     x=prep(d); s=score_latest(x); ts=technical_structure(x)
                     a1,a2,br,rc,chase,stop,t1,tgt=v16_plan(x,s,ts)
-                    # 綜合排序：品質、共振、進場分；價格方向由 v16_plan 保護
                     rank=float(s["品質分"])+float(ts["共振"])*4+float(s["進場分"])*0.5
                     results.append({
-                        "代號":sid,
-                        "名稱":row.get("stock_name",""),
-                        "現價":float(s["收盤"]),
-                        "成交量(張)":round(float(row["成交量_張"]),0),
-                        "品質分":s["品質分"],"進場分":s["進場分"],
-                        "趨勢":ts["趨勢結構"],"共振":ts["共振"],"量比":s["量比"],
+                        "代號":sid,"名稱":row.get("stock_name",""),"市場":row.get("market",""),
+                        "現價":float(s["收盤"]),"成交量(張)":round(float(row["成交量(張)"]),0),
+                        "品質分":s["品質分"],"進場分":s["進場分"],"趨勢":ts["趨勢結構"],
+                        "共振":ts["共振"],"量比":s["量比"],
                         "A回檔下":a1,"A回檔上":a2,"B突破":br,"C站回":rc,
-                        "禁止追價":chase,"停損":stop,"第一目標":t1,"型態目標":tgt,
-                        "_rank":rank
+                        "禁止追價":chase,"停損":stop,"第一目標":t1,"型態目標":tgt,"_rank":rank
                     })
             except Exception as e:
                 errors.append(f"{sid}: {type(e).__name__}: {str(e)[:120]}")
@@ -668,34 +716,24 @@ if st.button("🚀 啟動 V1.7 全市場自動選股",type="primary",use_contain
         bar.empty()
 
         if not results:
-            st.error("全市場快照成功，但歷史 K 線階段全部失敗。")
-            if errors:
-                st.code("\n".join(errors[:5]))
-            st.info("這代表問題已縮小到 TaiwanStockPrice 歷史資料請求，不是全市場掃描或選股條件。")
+            st.error("官方免費市場海選成功，但 FinMind 歷史 K 線階段沒有完成任何股票。")
+            if errors: st.code("\n".join(errors[:8]))
             st.stop()
 
-        rr=pd.DataFrame(results).sort_values("_rank",ascending=False).head(v17_final).drop(columns=["_rank"]).reset_index(drop=True)
-        st.subheader("🎯 V1.7 今日候選")
+        rr=pd.DataFrame(results).sort_values("_rank",ascending=False).head(v18_final).drop(columns=["_rank"]).reset_index(drop=True)
+        st.subheader("🎯 V1.8 今日技術候選")
         c1,c2,c3,c4=st.columns(4)
-        c1.metric("完成分析",len(results))
-        c2.metric("最終候選",len(rr))
+        c1.metric("完成分析",len(results)); c2.metric("最終候選",len(rr))
         c3.metric("A回檔型",int(rr["A回檔下"].notna().sum()))
         c4.metric("B突破型",int(rr["B突破"].notna().sum()))
-
         tabs=st.tabs(["🔥 今日最佳","↩️ A回檔","🚀 B突破","📋 全部"])
-        with tabs[0]:
-            st.dataframe(rr.head(10),use_container_width=True,hide_index=True)
-        with tabs[1]:
-            st.dataframe(rr[rr["A回檔下"].notna()],use_container_width=True,hide_index=True)
-        with tabs[2]:
-            st.dataframe(rr[rr["B突破"].notna()],use_container_width=True,hide_index=True)
-        with tabs[3]:
-            st.dataframe(rr,use_container_width=True,hide_index=True)
-
+        with tabs[0]: st.dataframe(rr.head(10),use_container_width=True,hide_index=True)
+        with tabs[1]: st.dataframe(rr[rr["A回檔下"].notna()],use_container_width=True,hide_index=True)
+        with tabs[2]: st.dataframe(rr[rr["B突破"].notna()],use_container_width=True,hide_index=True)
+        with tabs[3]: st.dataframe(rr,use_container_width=True,hide_index=True)
         if errors:
             with st.expander(f"⚠️ {len(errors)} 檔歷史資料未完成"):
                 st.code("\n".join(errors[:10]))
-        st.caption("技術候選不是獲利機率或保證。A 回檔價必須低於現價；B 突破價必須高於現價。")
+        st.caption("資料海選來源：TWSE／TPEx 官方公開資料；歷史技術分析使用 FinMind。技術候選不代表保證獲利。")
     except Exception as e:
-        st.error(f"V1.7 資料引擎失敗：{type(e).__name__}: {e}")
-        st.caption("V1.7 會保留真正錯誤，不再把所有失敗吞成『0 檔』。")
+        st.error(f"V1.8 執行失敗：{type(e).__name__}: {e}")
