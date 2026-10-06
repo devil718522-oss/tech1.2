@@ -455,14 +455,14 @@ if "radar_out" in st.session_state:
         st.caption(f'20日平均 MFE：{bt["MFE20"].mean():.2%}｜平均 MAE：{bt["MAE20"].mean():.2%}')
         st.download_button("下載歷史驗證 CSV", bt.to_csv(index=False).encode("utf-8-sig"), "v1_3_backtest.csv", "text/csv")
 
-st.caption("V1.8.1｜官方免費海選＋歷史K線修正版，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
+st.caption("V1.8.2｜官方免費海選＋完整技術函式，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
 
 
 # ============================================================
 # V1.6 全市場自動選股雷達
 # ============================================================
 st.divider()
-st.header("🤖 V1.8.1｜免費市場資料＋歷史K線修正版")
+st.header("🤖 V1.8.2｜完整技術函式修正版")
 st.caption("自動取得上市櫃股票名單 → 快速篩選 → 完整技術分析。為避免 API 額度與手機逾時，採兩階段掃描。")
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -606,7 +606,86 @@ def prep(d):
     x["量比"]=x["VolumeRatio"]
     return x
 
-st.subheader("🆓 V1.8.1｜免費市場資料＋歷史K線修正版")
+
+def score_latest(x):
+    """V1.8.2 自包含技術評分。分數是規則評分，不是勝率。"""
+    r=x.iloc[-1]
+    close=float(r["Close"])
+    vr=float(r["VolumeRatio"]) if pd.notna(r.get("VolumeRatio",np.nan)) else 0.0
+    quality=0
+    quality += 15 if pd.notna(r.get("MA20")) and close>r["MA20"] else 0
+    quality += 15 if pd.notna(r.get("MA60")) and close>r["MA60"] else 0
+    quality += 15 if pd.notna(r.get("MA5")) and pd.notna(r.get("MA10")) and r["MA5"]>r["MA10"] else 0
+    quality += 15 if pd.notna(r.get("MA10")) and pd.notna(r.get("MA20")) and r["MA10"]>r["MA20"] else 0
+    quality += 10 if vr>=1.0 else 0
+    quality += 10 if pd.notna(r.get("MACD")) and pd.notna(r.get("Signal")) and r["MACD"]>r["Signal"] else 0
+    quality += 10 if pd.notna(r.get("PrevHH20")) and close>=float(r["PrevHH20"])*0.97 else 0
+    quality += 10 if len(x)>=2 and close>float(x.iloc[-2]["High"]) else 0
+    entry=0
+    entry += 30 if pd.notna(r.get("MA20")) and close>=r["MA20"] else 0
+    entry += 25 if vr>=0.8 else 0
+    entry += 25 if pd.notna(r.get("PrevHH20")) and close>=float(r["PrevHH20"])*0.98 else 0
+    entry += 20 if pd.notna(r.get("MACDHist")) and r["MACDHist"]>0 else 0
+    return {"品質分":int(min(quality,100)),"進場分":int(min(entry,100)),
+            "收盤":round(close,2),"量比":round(vr,2)}
+
+def technical_structure(x):
+    """V1.8.2 輕量結構判斷；提供自動雷達所需欄位。"""
+    r=x.iloc[-1]; close=float(r["Close"])
+    ma20=r.get("MA20",np.nan); ma60=r.get("MA60",np.nan)
+    if pd.notna(ma20) and pd.notna(ma60) and close>ma20>ma60:
+        trend="多頭"
+    elif pd.notna(ma20) and pd.notna(ma60) and close<ma20<ma60:
+        trend="空頭"
+    else:
+        trend="整理"
+    resonance=0
+    if trend=="多頭": resonance+=2
+    if pd.notna(r.get("MA5")) and pd.notna(r.get("MA10")) and r["MA5"]>r["MA10"]: resonance+=1
+    if pd.notna(ma20) and pd.notna(ma60) and ma20>ma60: resonance+=1
+    if float(r.get("VolumeRatio",0) or 0)>=1: resonance+=1
+    if pd.notna(r.get("MACD")) and pd.notna(r.get("Signal")) and r["MACD"]>r["Signal"]: resonance+=1
+    if pd.notna(ma20) and close>ma20: resonance+=1
+    if pd.notna(r.get("PrevHH20")) and close>=float(r["PrevHH20"])*0.97: resonance+=1
+    return {"趨勢結構":trend,"共振":int(min(resonance,8))}
+
+def v16_plan(x,s,ts):
+    """方向安全的 A/B/C 交易計畫：A 必低於現價，B 必高於現價。"""
+    r=x.iloc[-1]; close=float(r["Close"])
+    supports=[]
+    for c in ["MA10","MA20"]:
+        v=r.get(c,np.nan)
+        if pd.notna(v) and 0<float(v)<close: supports.append(float(v))
+    if supports:
+        center=max(supports)
+        a1=round(center*0.995,2); a2=round(min(center*1.005,close*0.998),2)
+        if a1>=a2: a1=a2=np.nan
+    else: a1=a2=np.nan
+
+    prevhh=r.get("PrevHH20",np.nan)
+    b=round(float(prevhh)*1.002,2) if pd.notna(prevhh) and float(prevhh)>close else np.nan
+
+    # C：若 20MA 在現價上方，視為站回確認價。
+    ma20=r.get("MA20",np.nan)
+    c=round(float(ma20)*1.002,2) if pd.notna(ma20) and float(ma20)>close else np.nan
+
+    chase_candidates=[v for v in [b,c] if pd.notna(v)]
+    chase=round(min(chase_candidates)*1.02,2) if chase_candidates else round(close*1.03,2)
+
+    stop_candidates=[]
+    for col in ["MA20","PrevLL20"]:
+        v=r.get(col,np.nan)
+        if pd.notna(v) and 0<float(v)<close: stop_candidates.append(float(v))
+    stop=round(max(stop_candidates)*0.985,2) if stop_candidates else round(close*0.95,2)
+
+    risk=max(close-stop,close*0.01)
+    t1=round(close+2*risk,2)
+    # 20日箱型幅度估算型態目標
+    hh=x["High"].tail(20).max(); ll=x["Low"].tail(20).min()
+    tgt=round(close+(hh-ll),2) if pd.notna(hh) and pd.notna(ll) else t1
+    return a1,a2,b,c,chase,stop,t1,tgt
+
+st.subheader("🆓 V1.8.2｜完整技術函式修正版")
 st.caption("第一階段改用 TWSE／TPEx 官方免費市場資料海選；FinMind 只負責少量候選的歷史 K 線。")
 
 with st.expander("⚙️ V1.8 掃描設定",expanded=False):
