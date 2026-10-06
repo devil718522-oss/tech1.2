@@ -455,14 +455,14 @@ if "radar_out" in st.session_state:
         st.caption(f'20日平均 MFE：{bt["MFE20"].mean():.2%}｜平均 MAE：{bt["MAE20"].mean():.2%}')
         st.download_button("下載歷史驗證 CSV", bt.to_csv(index=False).encode("utf-8-sig"), "v1_3_backtest.csv", "text/csv")
 
-st.caption("V1.6.2｜資料引擎診斷與自動選股，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
+st.caption("V1.7｜全市場快照＋技術結構選股，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
 
 
 # ============================================================
 # V1.6 全市場自動選股雷達
 # ============================================================
 st.divider()
-st.header("🤖 V1.6.2｜資料引擎診斷版")
+st.header("🤖 V1.7｜全市場快照引擎")
 st.caption("自動取得上市櫃股票名單 → 快速篩選 → 完整技術分析。為避免 API 額度與手機逾時，採兩階段掃描。")
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -567,137 +567,135 @@ def v162_probe_price(stock_id="2330"):
     except Exception as e:
         return False,None,f"{type(e).__name__}: {e}",0
 
-st.subheader("🔌 行情資料引擎")
-if st.button("① 先測試 2330 行情 API",use_container_width=True,key="v162probe"):
-    ok,http,msg,n=v162_probe_price("2330")
-    st.session_state["v162_api_ok"]=ok
-    st.session_state["v162_api_msg"]=msg
-    st.session_state["v162_api_http"]=http
-    if ok:
-        st.success(f"✅ 行情 API 正常｜HTTP {http}｜{msg}")
-        st.info("可以執行下一步的全市場自動選股。")
-    else:
-        st.error(f"❌ 行情 API 失敗｜HTTP {http if http is not None else '-'}")
-        st.code(msg)
-        if http==402 or "upper limit" in msg.lower():
-            st.warning("FinMind API 額度已用完。現在不要繼續掃 120 檔；等額度恢復或加入 FinMind token。")
-        elif http==429:
-            st.warning("請求過於頻繁。先停止掃描，稍後再試。")
-        else:
-            st.warning("這不是技術選股條件造成的。先依上面的原始錯誤修資料層。")
+st.subheader("⚡ V1.7｜全市場快照引擎")
+st.caption("先用一次全市場即時快照做流動性篩選，再只對少量候選抓歷史 K 線。避免 120 檔逐檔硬打 API。")
 
-if st.button("② 🚀 啟動全市場自動選股",type="primary",use_container_width=True,key="v16go"):
-    ok,http,msg,_=v162_probe_price("2330")
-    if not ok:
-        st.error(f"掃描已停止：2330 行情 API 測試失敗｜HTTP {http if http is not None else '-'}")
-        st.code(msg)
-        if http==402 or "upper limit" in msg.lower():
-            st.info("這代表 API 額度問題，不是今天沒有候選股。")
-        st.stop()
+with st.expander("⚙️ V1.7 掃描設定",expanded=False):
+    v17_minp=st.number_input("最低股價",1.0,1000.0,10.0,1.0,key="v17minp")
+    v17_maxp=st.number_input("最高股價",1.0,5000.0,800.0,10.0,key="v17maxp")
+    v17_minvol=st.number_input("當日最低成交量（張）",0,200000,1000,100,key="v17minvol")
+    v17_pool=st.slider("快照後留下幾檔做歷史技術分析",10,50,25,5,key="v17pool")
+    v17_final=st.slider("最後最多顯示候選",5,30,15,5,key="v17final")
+
+@st.cache_data(ttl=300,show_spinner=False)
+def v17_snapshot():
+    url="https://api.finmindtrade.com/api/v4/taiwan_stock_tick_snapshot"
+    r=requests.get(url,params={"data_id":""},timeout=30)
     try:
-        st.success("2330 行情測試成功，開始第一階段掃描。")
+        js=r.json()
+    except Exception:
+        raise RuntimeError(f"快照 API HTTP {r.status_code}｜非 JSON：{r.text[:200]}")
+    if r.status_code!=200 or js.get("status") not in (200,None):
+        raise RuntimeError(f"快照 API HTTP {r.status_code}｜status={js.get('status')}｜{js.get('msg','')}")
+    d=pd.DataFrame(js.get("data") or [])
+    if d.empty: raise RuntimeError("快照 API 成功回應，但沒有行情資料")
+    return d
+
+def v17_num(s):
+    return pd.to_numeric(s,errors="coerce")
+
+def v17_prepare_snapshot(d,universe,minp,maxp,minvol):
+    x=d.copy()
+    # 官方快照欄位
+    if "stock_id" not in x.columns or "close" not in x.columns:
+        raise RuntimeError("快照資料缺少 stock_id / close 欄位")
+    x["stock_id"]=x["stock_id"].astype(str)
+    x=x[x["stock_id"].str.fullmatch(r"\d{4}",na=False)]
+    x["close"]=v17_num(x["close"])
+    volcol="total_volume" if "total_volume" in x.columns else ("volume" if "volume" in x.columns else None)
+    if not volcol: raise RuntimeError("快照資料缺少成交量欄位")
+    x["成交量_張"]=v17_num(x[volcol])/1000.0
+    if "change_rate" in x.columns: x["漲跌幅"]=v17_num(x["change_rate"])
+    else: x["漲跌幅"]=np.nan
+    if "total_amount" in x.columns: x["成交額"]=v17_num(x["total_amount"])
+    elif "amount" in x.columns: x["成交額"]=v17_num(x["amount"])
+    else: x["成交額"]=x["close"]*v17_num(x[volcol])
+
+    # 與普通股清單 inner join，自動排掉 ETF / 指數等非普通股
+    u=universe.copy()
+    u["stock_id"]=u["stock_id"].astype(str)
+    keep=["stock_id"]+[c for c in ["stock_name","industry_category","type"] if c in u.columns]
+    x=x.merge(u[keep].drop_duplicates("stock_id"),on="stock_id",how="inner")
+    x=x[(x["close"]>=minp)&(x["close"]<=maxp)&(x["成交量_張"]>=minvol)]
+    x=x.sort_values(["成交額","成交量_張"],ascending=False)
+    return x
+
+def v17_history(sid,days=420):
+    end=pd.Timestamp.today().normalize()
+    start=end-pd.Timedelta(days=days)
+    return api_get("TaiwanStockPrice",sid,start.strftime("%Y-%m-%d"),end.strftime("%Y-%m-%d"))
+
+if st.button("🚀 啟動 V1.7 全市場自動選股",type="primary",use_container_width=True,key="v17go"):
+    try:
         uni=v16_stock_universe()
-        total_universe=len(uni)
-        if v16_exfin:
-            uni=uni[~uni.industry_category.astype(str).str.contains("金融|保險",regex=True,na=False)]
-        ids=uni.stock_id.tolist()
+        snap=v17_snapshot()
+        pool=v17_prepare_snapshot(snap,uni,v17_minp,v17_maxp,v17_minvol)
+        st.success(f"全市場快照成功：{len(snap)} 筆｜符合普通股＋價量條件：{len(pool)} 檔")
+        if pool.empty:
+            st.warning("快照正常，但目前沒有股票符合你設定的股價／成交量門檻。")
+            st.stop()
 
-        # 均勻覆蓋整個上市櫃代號，不再只掃前段代號。
-        if len(ids)>v16_seed:
-            idx=np.linspace(0,len(ids)-1,v16_seed,dtype=int)
-            ids=[ids[i] for i in idx]
-
-        st.write(f"市場普通股：{total_universe} 檔｜本輪第一階段：{len(ids)} 檔")
-        q=[]; stats={"資料成功":0,"資料不足/API失敗":0,"股價不符":0,"成交量不足":0,"通過快篩":0}
-        bar=st.progress(0,text="第一階段：價格／流動性快篩")
-        end=pd.Timestamp.today().normalize(); start1=end-pd.Timedelta(days=120)
-
-        for i,sid in enumerate(ids):
+        # 只取成交額前段少量股票，歷史 K 線請求由 120 次降到 10~50 次。
+        shortlist=pool.head(v17_pool).copy()
+        st.write(f"第二階段只分析流動性前段 **{len(shortlist)} 檔**，大幅降低 API 請求。")
+        results=[]; errors=[]
+        bar=st.progress(0,text="第二階段：歷史 K 線＋完整技術結構")
+        for i,row in shortlist.reset_index(drop=True).iterrows():
+            sid=str(row["stock_id"])
             try:
-                d=api_get("TaiwanStockPrice",sid,start1.strftime("%Y-%m-%d"),end.strftime("%Y-%m-%d"))
+                d=v17_history(sid)
                 if d.empty or len(d)<65:
-                    stats["資料不足/API失敗"]+=1
+                    errors.append(f"{sid}: 歷史資料不足")
                 else:
-                    x=prep(d)
-                    r=x.iloc[-1]; close=float(r.Close)
-                    av_lots=float(x.Volume.tail(20).mean())/1000.0
-                    stats["資料成功"]+=1
-                    if close<v16_minp or close>v16_maxp:
-                        stats["股價不符"]+=1
-                    elif av_lots<v16_minv:
-                        stats["成交量不足"]+=1
-                    else:
-                        score=0
-                        if close>r.MA20: score+=2
-                        if close>r.MA60: score+=2
-                        if r.MA5>r.MA10: score+=1
-                        if r.MA10>r.MA20: score+=1
-                        if r.VolumeRatio>=1: score+=1
-                        if pd.notna(r.PrevHH20) and close>=r.PrevHH20*0.97: score+=1
-                        q.append((sid,score,float(r.VolumeRatio),av_lots))
-                        stats["通過快篩"]+=1
-            except Exception:
-                stats["資料不足/API失敗"]+=1
-            bar.progress((i+1)/max(len(ids),1),text=f"第一階段 {i+1}/{len(ids)}")
-        bar.empty()
-
-        st.subheader("🧪 第一階段診斷")
-        c1,c2,c3,c4,c5=st.columns(5)
-        c1.metric("資料成功",stats["資料成功"])
-        c2.metric("資料/API失敗",stats["資料不足/API失敗"])
-        c3.metric("股價排除",stats["股價不符"])
-        c4.metric("量能排除",stats["成交量不足"])
-        c5.metric("通過",stats["通過快篩"])
-
-        if stats["資料成功"]==0:
-            st.error("目前不是選股條件問題：行情 API 沒有成功取得任何股票資料。請先停止掃描，避免繼續消耗 API 額度。")
-        elif not q:
-            st.warning("本輪有成功取得行情，但沒有股票通過股價＋成交量條件。現在可以從上方診斷直接看是哪一道門檻造成。")
-            st.info("注意：成交量已正確換算成『張』。例如介面設定 1000 張，程式實際要求 20 日平均至少 1,000,000 股。")
-        else:
-            q=sorted(q,key=lambda z:(z[1],z[2],z[3]),reverse=True)[:v16_full]
-            st.success(f"第一階段通過 {stats['通過快篩']} 檔；取技術快篩最佳 {len(q)} 檔進入完整結構分析。")
-
-            results=[]; bar2=st.progress(0,text="第二階段：完整技術結構")
-            start2=end-pd.Timedelta(days=420)
-            fail2=0
-            for i,(sid,qs,vr,av) in enumerate(q):
-                try:
-                    d=api_get("TaiwanStockPrice",sid,start2.strftime("%Y-%m-%d"),end.strftime("%Y-%m-%d"))
                     x=prep(d); s=score_latest(x); ts=technical_structure(x)
                     a1,a2,br,rc,chase,stop,t1,tgt=v16_plan(x,s,ts)
+                    # 綜合排序：品質、共振、進場分；價格方向由 v16_plan 保護
+                    rank=float(s["品質分"])+float(ts["共振"])*4+float(s["進場分"])*0.5
                     results.append({
-                        "代號":sid,"快篩分":qs,"品質分":s["品質分"],"進場分":s["進場分"],
-                        "趨勢":ts["趨勢結構"],"共振":ts["共振"],"現價":s["收盤"],"量比":s["量比"],
-                        "20日均量(張)":av,"A回檔下":a1,"A回檔上":a2,"B突破":br,"C站回":rc,
-                        "禁止追價":chase,"停損":stop,"第一目標":t1,"型態目標":tgt
+                        "代號":sid,
+                        "名稱":row.get("stock_name",""),
+                        "現價":float(s["收盤"]),
+                        "成交量(張)":round(float(row["成交量_張"]),0),
+                        "品質分":s["品質分"],"進場分":s["進場分"],
+                        "趨勢":ts["趨勢結構"],"共振":ts["共振"],"量比":s["量比"],
+                        "A回檔下":a1,"A回檔上":a2,"B突破":br,"C站回":rc,
+                        "禁止追價":chase,"停損":stop,"第一目標":t1,"型態目標":tgt,
+                        "_rank":rank
                     })
-                except Exception:
-                    fail2+=1
-                bar2.progress((i+1)/max(len(q),1),text=f"完整分析 {i+1}/{len(q)}")
-            bar2.empty()
+            except Exception as e:
+                errors.append(f"{sid}: {type(e).__name__}: {str(e)[:120]}")
+            bar.progress((i+1)/max(len(shortlist),1),text=f"完整分析 {i+1}/{len(shortlist)}")
+        bar.empty()
 
-            if results:
-                rr=pd.DataFrame(results).sort_values(["品質分","共振","進場分"],ascending=False).reset_index(drop=True)
-                st.subheader("🎯 自動選股結果")
-                m1,m2,m3,m4=st.columns(4)
-                m1.metric("完整候選",len(rr))
-                m2.metric("回檔型",int(rr["A回檔下"].notna().sum()))
-                m3.metric("突破型",int(rr["B突破"].notna().sum()))
-                m4.metric("高共振 6+",int((rr["共振"]>=6).sum()))
-                tabs=st.tabs(["🔥 今日最佳","↩️ 回檔雷達","🚀 突破雷達","📋 全部候選"])
-                with tabs[0]:
-                    st.dataframe(rr.head(10),use_container_width=True,hide_index=True)
-                with tabs[1]:
-                    st.dataframe(rr[rr["A回檔下"].notna()].head(15),use_container_width=True,hide_index=True)
-                with tabs[2]:
-                    st.dataframe(rr[rr["B突破"].notna()].head(15),use_container_width=True,hide_index=True)
-                with tabs[3]:
-                    st.dataframe(rr,use_container_width=True,hide_index=True)
-                if fail2:
-                    st.caption(f"第二階段另有 {fail2} 檔因資料/API 問題未完成。")
-            else:
-                st.warning(f"第一階段有候選，但第二階段 0 檔完成；失敗 {fail2} 檔。這通常是 API 額度或完整歷史資料取得問題。")
+        if not results:
+            st.error("全市場快照成功，但歷史 K 線階段全部失敗。")
+            if errors:
+                st.code("\n".join(errors[:5]))
+            st.info("這代表問題已縮小到 TaiwanStockPrice 歷史資料請求，不是全市場掃描或選股條件。")
+            st.stop()
+
+        rr=pd.DataFrame(results).sort_values("_rank",ascending=False).head(v17_final).drop(columns=["_rank"]).reset_index(drop=True)
+        st.subheader("🎯 V1.7 今日候選")
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric("完成分析",len(results))
+        c2.metric("最終候選",len(rr))
+        c3.metric("A回檔型",int(rr["A回檔下"].notna().sum()))
+        c4.metric("B突破型",int(rr["B突破"].notna().sum()))
+
+        tabs=st.tabs(["🔥 今日最佳","↩️ A回檔","🚀 B突破","📋 全部"])
+        with tabs[0]:
+            st.dataframe(rr.head(10),use_container_width=True,hide_index=True)
+        with tabs[1]:
+            st.dataframe(rr[rr["A回檔下"].notna()],use_container_width=True,hide_index=True)
+        with tabs[2]:
+            st.dataframe(rr[rr["B突破"].notna()],use_container_width=True,hide_index=True)
+        with tabs[3]:
+            st.dataframe(rr,use_container_width=True,hide_index=True)
+
+        if errors:
+            with st.expander(f"⚠️ {len(errors)} 檔歷史資料未完成"):
+                st.code("\n".join(errors[:10]))
+        st.caption("技術候選不是獲利機率或保證。A 回檔價必須低於現價；B 突破價必須高於現價。")
     except Exception as e:
-        st.error(f"自動選股啟動失敗：{e}")
-        st.caption("這裡會保留錯誤訊息，方便下一步精準修正。")
+        st.error(f"V1.7 資料引擎失敗：{type(e).__name__}: {e}")
+        st.caption("V1.7 會保留真正錯誤，不再把所有失敗吞成『0 檔』。")
