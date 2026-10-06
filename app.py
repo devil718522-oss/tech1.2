@@ -4,8 +4,8 @@ import numpy as np
 import requests
 from datetime import date, timedelta
 
-st.set_page_config(page_title="家銘趨勢雷達 V1.4", page_icon="📡", layout="wide")
-st.title("📡 家銘趨勢雷達 V1.4")
+st.set_page_config(page_title="家銘趨勢雷達 V1.4.1", page_icon="📡", layout="wide")
+st.title("📡 家銘趨勢雷達 V1.4.1")
 st.caption("技術面型態雷達｜品質分 × 進場分 × 追高風險 × 歷史驗證")
 
 API = "https://api.finmindtrade.com/api/v4/data"
@@ -181,91 +181,163 @@ def line_value(p1, p2, at_i):
     return v1 + (v2-v1)/(i2-i1)*(at_i-i1)
 
 def technical_structure(x):
-    r=x.iloc[-1]; idx=len(x)-1
-    hs,ls=swing_points(x)
-    trend="盤整"
-    if len(hs)>=2 and len(ls)>=2:
-        if hs[-1][1]>hs[-2][1] and ls[-1][1]>ls[-2][1]: trend="多頭"
-        elif hs[-1][1]<hs[-2][1] and ls[-1][1]<ls[-2][1]: trend="空頭"
+    r = x.iloc[-1]
+    idx = len(x) - 1
+    hs, ls = swing_points(x)
+    trend = "盤整"
+    if len(hs) >= 2 and len(ls) >= 2:
+        if hs[-1][1] > hs[-2][1] and ls[-1][1] > ls[-2][1]:
+            trend = "多頭"
+        elif hs[-1][1] < hs[-2][1] and ls[-1][1] < ls[-2][1]:
+            trend = "空頭"
 
-    up_line=np.nan; down_line=np.nan
-    if len(ls)>=2 and ls[-1][1]>ls[-2][1]:
-        up_line=line_value(ls[-2],ls[-1],idx)
-    if len(hs)>=2 and hs[-1][1]<hs[-2][1]:
-        down_line=line_value(hs[-2],hs[-1],idx)
+    up_line = np.nan
+    down_line = np.nan
+    if len(ls) >= 2 and ls[-1][1] > ls[-2][1]:
+        up_line = line_value(ls[-2], ls[-1], idx)
+    if len(hs) >= 2 and hs[-1][1] < hs[-2][1]:
+        down_line = line_value(hs[-2], hs[-1], idx)
 
-    # ABC：最近三個交替的重要轉折，以 A低-B高-C低 的多頭修正為主
-    abc=False; A=B=C=np.nan
-    if len(ls)>=2 and len(hs)>=1:
-        candidates=[]
+    # ABC：最近 A低-B高-C低，多頭修正結構
+    abc = False
+    A = B = C = np.nan
+    if len(ls) >= 2 and len(hs) >= 1:
+        candidates = []
         for a in ls:
             for b in hs:
                 for c in ls:
                     if a[0] < b[0] < c[0]:
-                        candidates.append((a,b,c))
+                        candidates.append((a, b, c))
         if candidates:
-            a,b,c=max(candidates,key=lambda t:t[2][0])
-            A,B,C=a[1],b[1],c[1]
-            abc=(B>A and C>A and C<B)
+            a, b, c = max(candidates, key=lambda t: t[2][0])
+            A, B, C = a[1], b[1], c[1]
+            abc = (B > A and C > A and C < B)
 
-    prev_high = r.PrevHH20
-    resistance = min([v for v in [prev_high, hs[-1][1] if hs else np.nan, B] if pd.notna(v) and v>=r.Close],
-                     default=prev_high if pd.notna(prev_high) else np.nan)
-    breakout_trigger = (float(resistance)*1.002) if pd.notna(resistance) else np.nan
+    # 壓力：以「已知的前高」為主。即使現價已突破，也保留原突破基準，才能判斷是否追高。
+    resistance_candidates = [v for v in [r.PrevHH20, hs[-1][1] if hs else np.nan, B] if pd.notna(v)]
+    below_or_near = [v for v in resistance_candidates if v <= r.Close * 1.03]
+    resistance = max(below_or_near) if below_or_near else (min(resistance_candidates) if resistance_candidates else np.nan)
+    right_trigger = float(resistance) * 1.002 if pd.notna(resistance) else np.nan
 
-    supports=[v for v in [r.MA10,r.MA20,up_line,C,ls[-1][1] if ls else np.nan] if pd.notna(v) and v<r.Close]
-    structural_stop=max(supports) if supports else float(r.Close)*0.95
+    # 回測區與結構防守
+    pull_vals = [v for v in [r.MA10, r.MA20, up_line] if pd.notna(v)]
+    pullback_zone_low = min(pull_vals) if pull_vals else np.nan
+    pullback_zone_high = max(pull_vals) if pull_vals else np.nan
 
-    # 左側：回測10/20MA或上升切線後，以當日高點+0.2%作確認；右側：突破主要壓力
-    pullback_zone_low=min([v for v in [r.MA10,r.MA20,up_line] if pd.notna(v)], default=np.nan)
-    pullback_zone_high=max([v for v in [r.MA10,r.MA20,up_line] if pd.notna(v)], default=np.nan)
-    left_trigger=float(r.High)*1.002 if trend=="多頭" and pd.notna(pullback_zone_high) and r.Low<=pullback_zone_high*1.02 else np.nan
-    right_trigger=breakout_trigger
+    stop_candidates = [v for v in [r.MA20, up_line, C, ls[-1][1] if ls else np.nan]
+                       if pd.notna(v) and v < r.Close]
+    structural_stop = max(stop_candidates) if stop_candidates else float(r.Close) * 0.95
+    # 留一點價格雜訊空間，避免剛碰支撐就被洗掉
+    structural_stop *= 0.995
 
-    # 型態目標：ABC 等幅 AB 自 C 投射；否則20日箱體等幅
-    target=np.nan; target_type="—"
+    # 左側觸發改用「前一交易日高點」，今日收盤才有可能真正觸發；不再用今日 High 自己追自己。
+    prev_high = float(x["High"].iloc[-2]) if len(x) >= 2 else np.nan
+    touched_pullback = (trend == "多頭" and pd.notna(pullback_zone_high)
+                        and r.Low <= pullback_zone_high * 1.02
+                        and r.Close >= pullback_zone_low * 0.98)
+    left_trigger = prev_high * 1.002 if touched_pullback and pd.notna(prev_high) else np.nan
+
+    # 型態目標
+    target = np.nan
+    target_type = "—"
     if abc:
-        target=C+(B-A); target_type="ABC等幅"
+        target = C + (B - A)
+        target_type = "ABC等幅"
     elif pd.notna(r.PrevHH20) and pd.notna(r.PrevLL20):
-        target=r.PrevHH20+(r.PrevHH20-r.PrevLL20); target_type="20日箱型等幅"
+        target = r.PrevHH20 + (r.PrevHH20 - r.PrevLL20)
+        target_type = "20日箱型等幅"
 
-    chosen_entry = left_trigger if pd.notna(left_trigger) and left_trigger>=r.Close*0.98 else right_trigger
-    rr=np.nan
-    if pd.notna(chosen_entry) and pd.notna(target) and chosen_entry>structural_stop and target>chosen_entry:
-        rr=(target-chosen_entry)/(chosen_entry-structural_stop)
-
-    resonance=0; reasons=[]
-    for ok,msg in [
-        (trend=="多頭","頭頭高、底底高"),
-        (r.MA5>r.MA10>r.MA20,"5>10>20多排"),
-        (r.MA20>r.MA60,"20MA>60MA"),
-        (pd.notna(up_line) and r.Close>=up_line,"守上升切線"),
-        (abc,"ABC多頭修正"),
-        (r.VR>=1.0,"量能不弱"),
-        (r.MACD>r.SIGNAL,"MACD偏多"),
-        (r.Close>r.MA20,"站上20MA"),
+    # 技術共振
+    resonance = 0
+    reasons = []
+    for ok, msg in [
+        (trend == "多頭", "頭頭高、底底高"),
+        (r.MA5 > r.MA10 > r.MA20, "5>10>20多排"),
+        (r.MA20 > r.MA60, "20MA>60MA"),
+        (pd.notna(up_line) and r.Close >= up_line, "守上升切線"),
+        (abc, "ABC多頭修正"),
+        (r.VR >= 1.0, "量能不弱"),
+        (r.MACD > r.SIGNAL, "MACD偏多"),
+        (r.Close > r.MA20, "站上20MA"),
     ]:
-        if bool(ok): resonance+=1; reasons.append(msg)
+        if bool(ok):
+            resonance += 1
+            reasons.append(msg)
 
-    if r.Close < structural_stop:
-        status="🔴 結構失效"
-    elif pd.notna(right_trigger) and r.Close>=right_trigger:
-        status="🟢 右側突破已觸發"
-    elif pd.notna(left_trigger) and r.Close>=left_trigger:
-        status="🟢 左側轉強已觸發"
-    elif trend=="多頭":
-        status="🟡 等待觸發"
-    else:
-        status="⚪ 結構未完成"
+    # === V1.4.1 交易決策層 ===
+    close = float(r.Close)
+    atr = (x["High"] - x["Low"]).rolling(14).mean().iloc[-1]
+    atr_pct = float(atr / close) if pd.notna(atr) and close > 0 else 0.02
+    chase_limit = max(0.025, min(0.06, atr_pct * 1.5))  # 個股波動越大，容許區略寬
+
+    action = "⚪ 結構未完成"
+    entry_low = entry_high = planned_entry = np.nan
+    trigger_type = "—"
+    breakout_gap = np.nan
+
+    if close < structural_stop:
+        action = "🔴 結構失效／不進"
+    elif pd.notna(right_trigger) and close >= right_trigger:
+        breakout_gap = close / right_trigger - 1
+        trigger_type = "右側突破"
+        if breakout_gap <= chase_limit:
+            # 已突破但仍在合理區：不叫使用者回頭買舊突破價，改用目前可接受區間
+            entry_low = max(right_trigger, close * 0.985)
+            entry_high = min(close * 1.01, right_trigger * (1 + chase_limit))
+            planned_entry = (entry_low + entry_high) / 2
+            action = "🟢 突破後合理區"
+        else:
+            # 已離突破點太遠，等待回測，不追價
+            entry_low = right_trigger * 0.995
+            entry_high = right_trigger * 1.015
+            planned_entry = (entry_low + entry_high) / 2
+            action = "🟡 已突破／乖離過大，等回測"
+    elif pd.notna(left_trigger) and close >= left_trigger:
+        trigger_type = "左側回測轉強"
+        entry_low = left_trigger
+        entry_high = left_trigger * 1.015
+        planned_entry = (entry_low + entry_high) / 2
+        action = "🟢 回測轉強可觀察"
+    elif trend == "多頭" and pd.notna(right_trigger):
+        trigger_type = "等待右側突破"
+        entry_low = right_trigger
+        entry_high = right_trigger * 1.015
+        planned_entry = (entry_low + entry_high) / 2
+        action = "🟡 等待突破"
+    elif trend == "多頭" and pd.notna(left_trigger):
+        trigger_type = "等待左側轉強"
+        entry_low = left_trigger
+        entry_high = left_trigger * 1.015
+        planned_entry = (entry_low + entry_high) / 2
+        action = "🟡 等待回測轉強"
+
+    # 第一目標：至少先看 1.5R；型態目標作第二目標。
+    rr = np.nan
+    target1 = np.nan
+    if pd.notna(planned_entry) and planned_entry > structural_stop:
+        risk_per_share = planned_entry - structural_stop
+        target1 = planned_entry + risk_per_share * 1.5
+        if pd.notna(target) and target > planned_entry:
+            rr = (target - planned_entry) / risk_per_share
+
+    # 風報比過濾：不足 1.5R 不值得做；若型態目標已在現價下方，也直接放棄。
+    if pd.notna(planned_entry):
+        if pd.notna(target) and target <= planned_entry:
+            action = "🔴 目標空間不足／不進"
+        elif pd.notna(rr) and rr < 1.5:
+            action = "🔴 風報比不足／不進"
 
     return {
-        "趨勢結構":trend,"共振":resonance,"共振理由":reasons,
-        "上升切線":up_line,"下降切線":down_line,
-        "ABC":abc,"A":A,"B":B,"C":C,
-        "回測區下":pullback_zone_low,"回測區上":pullback_zone_high,
-        "左側觸發":left_trigger,"右側突破":right_trigger,
-        "結構停損":structural_stop,"目標價":target,"目標類型":target_type,
-        "風報比":rr,"結構狀態":status
+        "趨勢結構": trend, "共振": resonance, "共振理由": reasons,
+        "上升切線": up_line, "下降切線": down_line,
+        "ABC": abc, "A": A, "B": B, "C": C,
+        "回測區下": pullback_zone_low, "回測區上": pullback_zone_high,
+        "左側觸發": left_trigger, "右側突破": right_trigger,
+        "進場區下": entry_low, "進場區上": entry_high, "預定進場": planned_entry,
+        "觸發類型": trigger_type, "突破乖離": breakout_gap,
+        "結構停損": structural_stop, "第一目標": target1,
+        "目標價": target, "目標類型": target_type,
+        "風報比": rr, "結構狀態": action, "追價容許": chase_limit
     }
 
 def grade(v):
@@ -297,7 +369,7 @@ def backtest(x, threshold=72, cooldown=5, cost=0.00585):
 with st.sidebar:
     token = st.text_input("FinMind Token（可留空；依 API 權限而定）", type="password")
     history_days = st.slider("下載歷史日數", 450, 1800, 900, 50)
-    st.caption("V1.4：品質 × 進場 × 技術結構 × 明確觸發/停損/目標價。")
+    st.caption("V1.4.1：加入突破後追價判斷、實際進場區、真實風報比與不值得交易過濾。")
 
 mode = st.radio("掃描模式", ["📚 內建選股池", "✍️ 手動檢測"], horizontal=True)
 
@@ -311,7 +383,7 @@ else:
     raw = st.text_area("輸入股票代號｜一行一個", "2376\n3481\n2330", height=180)
     stocks = [s.strip() for s in raw.replace(",", "\n").splitlines() if s.strip().isdigit()]
 
-if st.button("📡 啟動 V1.4 技術結構雷達", type="primary", use_container_width=True):
+if st.button("📡 啟動 V1.4.1 技術結構雷達", type="primary", use_container_width=True):
     end = date.today()
     start = end - timedelta(days=history_days)
     rows, details, datasets = [], {}, {}
@@ -333,7 +405,9 @@ if st.button("📡 啟動 V1.4 技術結構雷達", type="primary", use_containe
                 "20日漲跌": s["20日漲跌"], "趨勢結構": ts["趨勢結構"],
                 "技術共振": ts["共振"], "結構狀態": ts["結構狀態"],
                 "左側觸發": ts["左側觸發"], "右側突破": ts["右側突破"],
-                "結構停損": ts["結構停損"], "目標價": ts["目標價"], "風報比": ts["風報比"]
+                "進場區下": ts["進場區下"], "進場區上": ts["進場區上"],
+                "結構停損": ts["結構停損"], "第一目標": ts["第一目標"],
+                "目標價": ts["目標價"], "風報比": ts["風報比"]
             })
             s["structure"] = ts
             details[sid] = s
@@ -368,9 +442,9 @@ if "radar_out" in st.session_state:
     st.dataframe(show, use_container_width=True, hide_index=True)
 
     st.header("🧭 技術結構決策")
-    decision_cols=["代號","趨勢結構","技術共振","結構狀態","收盤","左側觸發","右側突破","結構停損","目標價","風報比"]
+    decision_cols=["代號","趨勢結構","技術共振","結構狀態","收盤","右側突破","進場區下","進場區上","結構停損","第一目標","目標價","風報比"]
     decision=out[decision_cols].copy()
-    for c in ["收盤","左側觸發","右側突破","結構停損","目標價"]:
+    for c in ["收盤","右側突破","進場區下","進場區上","結構停損","第一目標","目標價"]:
         decision[c]=decision[c].map(lambda v: "-" if pd.isna(v) else f"{v:.2f}")
     decision["風報比"]=decision["風報比"].map(lambda v:"-" if pd.isna(v) else f"1:{v:.2f}")
     st.dataframe(decision,use_container_width=True,hide_index=True)
@@ -383,15 +457,18 @@ if "radar_out" in st.session_state:
             if ts["ABC"]:
                 st.write(f'**ABC：** A {ts["A"]:.2f} → B {ts["B"]:.2f} → C {ts["C"]:.2f}')
             c1,c2,c3,c4=st.columns(4)
-            c1.metric("左側觸發","-" if pd.isna(ts["左側觸發"]) else f'{ts["左側觸發"]:.2f}')
-            c2.metric("右側突破","-" if pd.isna(ts["右側突破"]) else f'{ts["右側突破"]:.2f}')
+            c1.metric("右側突破","-" if pd.isna(ts["右側突破"]) else f'{ts["右側突破"]:.2f}')
+            zone = "-" if pd.isna(ts["進場區下"]) else f'{ts["進場區下"]:.2f}～{ts["進場區上"]:.2f}'
+            c2.metric("建議進場區", zone)
             c3.metric("跌破退出","-" if pd.isna(ts["結構停損"]) else f'{ts["結構停損"]:.2f}')
-            c4.metric(ts["目標類型"],"-" if pd.isna(ts["目標價"]) else f'{ts["目標價"]:.2f}')
+            c4.metric("第一目標","-" if pd.isna(ts["第一目標"]) else f'{ts["第一目標"]:.2f}')
+            st.write(f'**型態目標（{ts["目標類型"]}）：** '+("-" if pd.isna(ts["目標價"]) else f'{ts["目標價"]:.2f}'))
+            st.write(f'**目前決策：{ts["結構狀態"]}**')
             if pd.notna(ts["回測區下"]) and pd.notna(ts["回測區上"]):
                 st.caption(f'回測觀察區：{ts["回測區下"]:.2f} ～ {ts["回測區上"]:.2f}')
             if pd.notna(ts["風報比"]):
                 st.write(f'**預估風報比：1 : {ts["風報比"]:.2f}**')
-            st.caption("左側觸發、突破、停損與目標價皆為規則化技術結構研究值，需搭配成交量與實際K線確認。")
+            st.caption("V1.4.1 會區分『突破觸發價』與『目前可接受進場區』；已離突破點過遠會改為等待回測。價位仍為規則化研究值，需搭配成交量與實際K線確認。")
 
     st.header("🎯 現在的進場候選")
     candidates = out[out["狀態"].isin(["🟢 突破候選","🟢 回測／均線買點候選","🟡 等待買點"])].copy()
@@ -455,4 +532,4 @@ if "radar_out" in st.session_state:
         st.caption(f'20日平均 MFE：{bt["MFE20"].mean():.2%}｜平均 MAE：{bt["MAE20"].mean():.2%}')
         st.download_button("下載歷史驗證 CSV", bt.to_csv(index=False).encode("utf-8-sig"), "v1_3_backtest.csv", "text/csv")
 
-st.caption("V1.4｜研究與策略驗證用途，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
+st.caption("V1.4.1｜研究與策略驗證用途，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
