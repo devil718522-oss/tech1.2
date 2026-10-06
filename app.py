@@ -455,14 +455,14 @@ if "radar_out" in st.session_state:
         st.caption(f'20日平均 MFE：{bt["MFE20"].mean():.2%}｜平均 MAE：{bt["MAE20"].mean():.2%}')
         st.download_button("下載歷史驗證 CSV", bt.to_csv(index=False).encode("utf-8-sig"), "v1_3_backtest.csv", "text/csv")
 
-st.caption("V1.8｜官方免費市場海選＋FinMind技術分析，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
+st.caption("V1.8.1｜官方免費海選＋歷史K線修正版，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
 
 
 # ============================================================
 # V1.6 全市場自動選股雷達
 # ============================================================
 st.divider()
-st.header("🤖 V1.8｜官方免費市場資料引擎")
+st.header("🤖 V1.8.1｜免費市場資料＋歷史K線修正版")
 st.caption("自動取得上市櫃股票名單 → 快速篩選 → 完整技術分析。為避免 API 額度與手機逾時，採兩階段掃描。")
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -567,7 +567,46 @@ def v162_probe_price(stock_id="2330"):
     except Exception as e:
         return False,None,f"{type(e).__name__}: {e}",0
 
-st.subheader("🆓 V1.8｜官方免費市場資料引擎")
+
+def prep(d):
+    """V1.8.1 歷史 K 線標準化：FinMind TaiwanStockPrice -> 技術分析欄位。"""
+    x=d.copy()
+    ren={
+        "date":"Date","open":"Open","max":"High","min":"Low","close":"Close",
+        "Trading_Volume":"Volume","Trading_money":"Amount"
+    }
+    x=x.rename(columns={k:v for k,v in ren.items() if k in x.columns})
+    required=["Open","High","Low","Close","Volume"]
+    missing=[c for c in required if c not in x.columns]
+    if missing:
+        raise ValueError("歷史 K 線缺少欄位："+",".join(missing))
+    for c in required:
+        x[c]=pd.to_numeric(x[c],errors="coerce")
+    x=x.dropna(subset=["Open","High","Low","Close"]).reset_index(drop=True)
+    if "Date" in x.columns:
+        x["Date"]=pd.to_datetime(x["Date"],errors="coerce")
+        x=x.sort_values("Date").reset_index(drop=True)
+
+    for n in [5,10,20,60,120,200]:
+        x[f"MA{n}"]=x["Close"].rolling(n).mean()
+    x["VolMA20"]=x["Volume"].rolling(20).mean()
+    x["VolumeRatio"]=x["Volume"]/x["VolMA20"].replace(0,np.nan)
+    x["PrevHH20"]=x["High"].rolling(20).max().shift(1)
+    x["PrevLL20"]=x["Low"].rolling(20).min().shift(1)
+
+    # MACD
+    ema12=x["Close"].ewm(span=12,adjust=False).mean()
+    ema26=x["Close"].ewm(span=26,adjust=False).mean()
+    x["MACD"]=ema12-ema26
+    x["Signal"]=x["MACD"].ewm(span=9,adjust=False).mean()
+    x["MACDHist"]=x["MACD"]-x["Signal"]
+
+    # Common aliases used by older scoring code.
+    x["收盤"]=x["Close"]
+    x["量比"]=x["VolumeRatio"]
+    return x
+
+st.subheader("🆓 V1.8.1｜免費市場資料＋歷史K線修正版")
 st.caption("第一階段改用 TWSE／TPEx 官方免費市場資料海選；FinMind 只負責少量候選的歷史 K 線。")
 
 with st.expander("⚙️ V1.8 掃描設定",expanded=False):
