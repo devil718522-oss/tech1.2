@@ -455,14 +455,14 @@ if "radar_out" in st.session_state:
         st.caption(f'20日平均 MFE：{bt["MFE20"].mean():.2%}｜平均 MAE：{bt["MAE20"].mean():.2%}')
         st.download_button("下載歷史驗證 CSV", bt.to_csv(index=False).encode("utf-8-sig"), "v1_3_backtest.csv", "text/csv")
 
-st.caption("V1.4｜研究與策略驗證用途，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
+st.caption("V1.6.1｜自動選股與策略驗證用途，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
 
 
 # ============================================================
 # V1.6 全市場自動選股雷達
 # ============================================================
 st.divider()
-st.header("🤖 V1.6｜自動選股雷達")
+st.header("🤖 V1.6.1｜自動選股雷達")
 st.caption("自動取得上市櫃股票名單 → 快速篩選 → 完整技術分析。為避免 API 額度與手機逾時，採兩階段掃描。")
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -517,8 +517,9 @@ def v16_quick(sid,min_price,max_price,min_vol):
     x=prep(d)
     if x.empty: return None
     r=x.iloc[-1]; close=float(r.Close)
-    av=float(x.Volume.tail(20).mean())
-    if close<min_price or close>max_price or av<min_vol: return None
+    av_shares=float(x.Volume.tail(20).mean())
+    av_lots=av_shares/1000.0
+    if close<min_price or close>max_price or av_lots<min_vol: return None
     q=0
     if close>r.MA20: q+=2
     if close>r.MA60: q+=2
@@ -526,7 +527,7 @@ def v16_quick(sid,min_price,max_price,min_vol):
     if r.MA10>r.MA20: q+=1
     if r.VolumeRatio>=1: q+=1
     if close>=r.PrevHH20*0.97: q+=1
-    return (sid,q,float(r.VolumeRatio),av)
+    return (sid,q,float(r.VolumeRatio),av_lots)
 
 with st.expander("⚙️ 自動選股設定",expanded=False):
     v16_minp=st.number_input("最低股價",1.0,1000.0,10.0,1.0,key="v16minp")
@@ -539,50 +540,94 @@ with st.expander("⚙️ 自動選股設定",expanded=False):
 if st.button("🚀 啟動全市場自動選股",type="primary",use_container_width=True,key="v16go"):
     try:
         uni=v16_stock_universe()
+        total_universe=len(uni)
         if v16_exfin:
             uni=uni[~uni.industry_category.astype(str).str.contains("金融|保險",regex=True,na=False)]
-        # 每次從完整 universe 均勻抽取，避免永遠只掃代號前段。
         ids=uni.stock_id.tolist()
+
+        # 均勻覆蓋整個上市櫃代號，不再只掃前段代號。
         if len(ids)>v16_seed:
-            step=max(len(ids)//v16_seed,1)
-            ids=ids[::step][:v16_seed]
-        st.write(f"第一階段掃描：{len(ids)} 檔")
-        q=[]; bar=st.progress(0)
+            idx=np.linspace(0,len(ids)-1,v16_seed,dtype=int)
+            ids=[ids[i] for i in idx]
+
+        st.write(f"市場普通股：{total_universe} 檔｜本輪第一階段：{len(ids)} 檔")
+        q=[]; stats={"資料成功":0,"資料不足/API失敗":0,"股價不符":0,"成交量不足":0,"通過快篩":0}
+        bar=st.progress(0,text="第一階段：價格／流動性快篩")
+        end=pd.Timestamp.today().normalize(); start1=end-pd.Timedelta(days=120)
+
         for i,sid in enumerate(ids):
             try:
-                z=v16_quick(sid,v16_minp,v16_maxp,v16_minv)
-                if z: q.append(z)
+                d=api_get("TaiwanStockPrice",sid,start1.strftime("%Y-%m-%d"),end.strftime("%Y-%m-%d"))
+                if d.empty or len(d)<65:
+                    stats["資料不足/API失敗"]+=1
+                else:
+                    x=prep(d)
+                    r=x.iloc[-1]; close=float(r.Close)
+                    av_lots=float(x.Volume.tail(20).mean())/1000.0
+                    stats["資料成功"]+=1
+                    if close<v16_minp or close>v16_maxp:
+                        stats["股價不符"]+=1
+                    elif av_lots<v16_minv:
+                        stats["成交量不足"]+=1
+                    else:
+                        score=0
+                        if close>r.MA20: score+=2
+                        if close>r.MA60: score+=2
+                        if r.MA5>r.MA10: score+=1
+                        if r.MA10>r.MA20: score+=1
+                        if r.VolumeRatio>=1: score+=1
+                        if pd.notna(r.PrevHH20) and close>=r.PrevHH20*0.97: score+=1
+                        q.append((sid,score,float(r.VolumeRatio),av_lots))
+                        stats["通過快篩"]+=1
             except Exception:
-                pass
-            bar.progress((i+1)/max(len(ids),1))
+                stats["資料不足/API失敗"]+=1
+            bar.progress((i+1)/max(len(ids),1),text=f"第一階段 {i+1}/{len(ids)}")
         bar.empty()
-        if not q:
-            st.warning("目前沒有快篩候選；可能條件太嚴、API 額度不足或資料尚未更新。")
+
+        st.subheader("🧪 第一階段診斷")
+        c1,c2,c3,c4,c5=st.columns(5)
+        c1.metric("資料成功",stats["資料成功"])
+        c2.metric("資料/API失敗",stats["資料不足/API失敗"])
+        c3.metric("股價排除",stats["股價不符"])
+        c4.metric("量能排除",stats["成交量不足"])
+        c5.metric("通過",stats["通過快篩"])
+
+        if stats["資料成功"]==0:
+            st.error("目前不是選股條件問題：行情 API 沒有成功取得任何股票資料。請先停止掃描，避免繼續消耗 API 額度。")
+        elif not q:
+            st.warning("本輪有成功取得行情，但沒有股票通過股價＋成交量條件。現在可以從上方診斷直接看是哪一道門檻造成。")
+            st.info("注意：成交量已正確換算成『張』。例如介面設定 1000 張，程式實際要求 20 日平均至少 1,000,000 股。")
         else:
             q=sorted(q,key=lambda z:(z[1],z[2],z[3]),reverse=True)[:v16_full]
-            results=[]; bar2=st.progress(0)
-            end=pd.Timestamp.today().normalize()
-            start=end-pd.Timedelta(days=420)
+            st.success(f"第一階段通過 {stats['通過快篩']} 檔；取技術快篩最佳 {len(q)} 檔進入完整結構分析。")
+
+            results=[]; bar2=st.progress(0,text="第二階段：完整技術結構")
+            start2=end-pd.Timedelta(days=420)
+            fail2=0
             for i,(sid,qs,vr,av) in enumerate(q):
                 try:
-                    d=api_get("TaiwanStockPrice",sid,start.strftime("%Y-%m-%d"),end.strftime("%Y-%m-%d"))
-                    x=prep(d)
-                    s=score_latest(x)
-                    ts=technical_structure(x)
+                    d=api_get("TaiwanStockPrice",sid,start2.strftime("%Y-%m-%d"),end.strftime("%Y-%m-%d"))
+                    x=prep(d); s=score_latest(x); ts=technical_structure(x)
                     a1,a2,br,rc,chase,stop,t1,tgt=v16_plan(x,s,ts)
                     results.append({
-                        "代號":sid,"品質分":s["品質分"],"進場分":s["進場分"],
+                        "代號":sid,"快篩分":qs,"品質分":s["品質分"],"進場分":s["進場分"],
                         "趨勢":ts["趨勢結構"],"共振":ts["共振"],"現價":s["收盤"],"量比":s["量比"],
-                        "A回檔下":a1,"A回檔上":a2,"B突破":br,"C站回":rc,
+                        "20日均量(張)":av,"A回檔下":a1,"A回檔上":a2,"B突破":br,"C站回":rc,
                         "禁止追價":chase,"停損":stop,"第一目標":t1,"型態目標":tgt
                     })
                 except Exception:
-                    pass
-                bar2.progress((i+1)/max(len(q),1))
+                    fail2+=1
+                bar2.progress((i+1)/max(len(q),1),text=f"完整分析 {i+1}/{len(q)}")
             bar2.empty()
+
             if results:
                 rr=pd.DataFrame(results).sort_values(["品質分","共振","進場分"],ascending=False).reset_index(drop=True)
-                st.success(f"完成：找到 {len(rr)} 檔完整候選")
+                st.subheader("🎯 自動選股結果")
+                m1,m2,m3,m4=st.columns(4)
+                m1.metric("完整候選",len(rr))
+                m2.metric("回檔型",int(rr["A回檔下"].notna().sum()))
+                m3.metric("突破型",int(rr["B突破"].notna().sum()))
+                m4.metric("高共振 6+",int((rr["共振"]>=6).sum()))
                 tabs=st.tabs(["🔥 今日最佳","↩️ 回檔雷達","🚀 突破雷達","📋 全部候選"])
                 with tabs[0]:
                     st.dataframe(rr.head(10),use_container_width=True,hide_index=True)
@@ -592,8 +637,10 @@ if st.button("🚀 啟動全市場自動選股",type="primary",use_container_wid
                     st.dataframe(rr[rr["B突破"].notna()].head(15),use_container_width=True,hide_index=True)
                 with tabs[3]:
                     st.dataframe(rr,use_container_width=True,hide_index=True)
+                if fail2:
+                    st.caption(f"第二階段另有 {fail2} 檔因資料/API 問題未完成。")
             else:
-                st.warning("快篩有候選，但完整分析未成功取得資料。")
+                st.warning(f"第一階段有候選，但第二階段 0 檔完成；失敗 {fail2} 檔。這通常是 API 額度或完整歷史資料取得問題。")
     except Exception as e:
         st.error(f"自動選股啟動失敗：{e}")
-        st.caption("若是 API 額度問題，稍後再試或使用 FinMind token。")
+        st.caption("這裡會保留錯誤訊息，方便下一步精準修正。")
