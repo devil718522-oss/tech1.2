@@ -455,14 +455,14 @@ if "radar_out" in st.session_state:
         st.caption(f'20日平均 MFE：{bt["MFE20"].mean():.2%}｜平均 MAE：{bt["MAE20"].mean():.2%}')
         st.download_button("下載歷史驗證 CSV", bt.to_csv(index=False).encode("utf-8-sig"), "v1_3_backtest.csv", "text/csv")
 
-st.caption("V1.6.1｜自動選股與策略驗證用途，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
+st.caption("V1.6.2｜資料引擎診斷與自動選股，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
 
 
 # ============================================================
 # V1.6 全市場自動選股雷達
 # ============================================================
 st.divider()
-st.header("🤖 V1.6.1｜自動選股雷達")
+st.header("🤖 V1.6.2｜資料引擎診斷版")
 st.caption("自動取得上市櫃股票名單 → 快速篩選 → 完整技術分析。為避免 API 額度與手機逾時，採兩階段掃描。")
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -537,8 +537,65 @@ with st.expander("⚙️ 自動選股設定",expanded=False):
     v16_seed=st.slider("第一階段掃描檔數",40,200,120,20,key="v16seed")
     v16_full=st.slider("進入完整分析檔數",10,60,30,5,key="v16full")
 
-if st.button("🚀 啟動全市場自動選股",type="primary",use_container_width=True,key="v16go"):
+
+def v162_probe_price(stock_id="2330"):
+    """先用單一股票驗證行情 API，保留 HTTP 與 FinMind 原始錯誤訊息。"""
+    url="https://api.finmindtrade.com/api/v4/data"
+    end=pd.Timestamp.today().normalize()
+    start=end-pd.Timedelta(days=30)
+    params={
+        "dataset":"TaiwanStockPrice",
+        "data_id":str(stock_id),
+        "start_date":start.strftime("%Y-%m-%d"),
+        "end_date":end.strftime("%Y-%m-%d")
+    }
     try:
+        resp=requests.get(url,params=params,timeout=30)
+        http=resp.status_code
+        try:
+            js=resp.json()
+        except Exception:
+            return False,http,f"非 JSON 回應：{resp.text[:300]}",0
+        status=js.get("status")
+        msg=js.get("msg","")
+        data=js.get("data") or []
+        if http!=200 or status not in (200,None):
+            return False,http,f"FinMind status={status}｜{msg}",len(data)
+        if not data:
+            return False,http,"API 回應成功，但 TaiwanStockPrice 沒有資料",0
+        return True,http,f"成功取得 {len(data)} 筆 2330 行情",len(data)
+    except Exception as e:
+        return False,None,f"{type(e).__name__}: {e}",0
+
+st.subheader("🔌 行情資料引擎")
+if st.button("① 先測試 2330 行情 API",use_container_width=True,key="v162probe"):
+    ok,http,msg,n=v162_probe_price("2330")
+    st.session_state["v162_api_ok"]=ok
+    st.session_state["v162_api_msg"]=msg
+    st.session_state["v162_api_http"]=http
+    if ok:
+        st.success(f"✅ 行情 API 正常｜HTTP {http}｜{msg}")
+        st.info("可以執行下一步的全市場自動選股。")
+    else:
+        st.error(f"❌ 行情 API 失敗｜HTTP {http if http is not None else '-'}")
+        st.code(msg)
+        if http==402 or "upper limit" in msg.lower():
+            st.warning("FinMind API 額度已用完。現在不要繼續掃 120 檔；等額度恢復或加入 FinMind token。")
+        elif http==429:
+            st.warning("請求過於頻繁。先停止掃描，稍後再試。")
+        else:
+            st.warning("這不是技術選股條件造成的。先依上面的原始錯誤修資料層。")
+
+if st.button("② 🚀 啟動全市場自動選股",type="primary",use_container_width=True,key="v16go"):
+    ok,http,msg,_=v162_probe_price("2330")
+    if not ok:
+        st.error(f"掃描已停止：2330 行情 API 測試失敗｜HTTP {http if http is not None else '-'}")
+        st.code(msg)
+        if http==402 or "upper limit" in msg.lower():
+            st.info("這代表 API 額度問題，不是今天沒有候選股。")
+        st.stop()
+    try:
+        st.success("2330 行情測試成功，開始第一階段掃描。")
         uni=v16_stock_universe()
         total_universe=len(uni)
         if v16_exfin:
