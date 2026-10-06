@@ -4,8 +4,8 @@ import numpy as np
 import requests
 from datetime import date, timedelta
 
-st.set_page_config(page_title="家銘趨勢雷達 V1.4.1", page_icon="📡", layout="wide")
-st.title("📡 家銘趨勢雷達 V1.4.1")
+st.set_page_config(page_title="家銘趨勢雷達 V1.4.2", page_icon="📡", layout="wide")
+st.title("📡 家銘趨勢雷達 V1.4.2")
 st.caption("技術面型態雷達｜品質分 × 進場分 × 追高風險 × 歷史驗證")
 
 API = "https://api.finmindtrade.com/api/v4/data"
@@ -340,6 +340,49 @@ def technical_structure(x):
         "風報比": rr, "結構狀態": action, "追價容許": chase_limit
     }
 
+
+def final_trade_decision(s, ts):
+    """把分數與結構整合成一個最終燈號；不是勝率或報酬保證。"""
+    quality = float(s["品質分"])
+    entry_score = float(s["進場分"])
+    resonance = int(ts["共振"])
+    vr = float(s["量比"]) if pd.notna(s["量比"]) else 0.0
+    rr = ts["風報比"]
+    state = ts["結構狀態"]
+
+    failed = []
+    if quality < 65:
+        failed.append(f"品質 {quality:.0f}<65")
+    if entry_score < 72:
+        failed.append(f"進場分 {entry_score:.0f}<72")
+    if resonance < 6:
+        failed.append(f"共振 {resonance}/8<6/8")
+    if vr < 1.0:
+        failed.append(f"量比 {vr:.2f}<1.00")
+    if pd.isna(rr) or rr < 1.5:
+        failed.append("風報比未達 1:1.5")
+
+    zone = "-"
+    if pd.notna(ts["進場區下"]) and pd.notna(ts["進場區上"]):
+        zone = f'{ts["進場區下"]:.2f}～{ts["進場區上"]:.2f}'
+
+    if "結構失效" in state or "不進" in state:
+        return "🔴 不進場", state.replace("🔴 ",""), zone
+    if failed:
+        return "🔴 不進場", "；".join(failed), zone
+    if "乖離過大" in state:
+        return "🔵 等待回測", f"已突破但離觸發點過遠；等回測 {zone}", zone
+    if "等待突破" in state:
+        p = ts["右側突破"]
+        reason = f"突破 {p:.2f} 且量比維持≥1.00再評估" if pd.notna(p) else "等待右側突破"
+        return "🟡 等待突破", reason, zone
+    if "等待回測轉強" in state:
+        return "🟡 等待轉強", f"等待回測後重新轉強；觀察 {zone}", zone
+    if ("突破後合理區" in state or "回測轉強可觀察" in state):
+        return "🟢 可進場候選", f"條件通過；參考進場區 {zone}", zone
+    return "⚪ 觀察", state.replace("⚪ ",""), zone
+
+
 def grade(v):
     return "S" if v >= 85 else "A" if v >= 75 else "B" if v >= 65 else "C"
 
@@ -369,7 +412,7 @@ def backtest(x, threshold=72, cooldown=5, cost=0.00585):
 with st.sidebar:
     token = st.text_input("FinMind Token（可留空；依 API 權限而定）", type="password")
     history_days = st.slider("下載歷史日數", 450, 1800, 900, 50)
-    st.caption("V1.4.1：加入突破後追價判斷、實際進場區、真實風報比與不值得交易過濾。")
+    st.caption("V1.4.2：新增最終交易燈號，把品質、進場分、共振、量價、結構與風報比整合成單一決策。")
 
 mode = st.radio("掃描模式", ["📚 內建選股池", "✍️ 手動檢測"], horizontal=True)
 
@@ -383,7 +426,7 @@ else:
     raw = st.text_area("輸入股票代號｜一行一個", "2376\n3481\n2330", height=180)
     stocks = [s.strip() for s in raw.replace(",", "\n").splitlines() if s.strip().isdigit()]
 
-if st.button("📡 啟動 V1.4.1 技術結構雷達", type="primary", use_container_width=True):
+if st.button("📡 啟動 V1.4.2 技術決策雷達", type="primary", use_container_width=True):
     end = date.today()
     start = end - timedelta(days=history_days)
     rows, details, datasets = [], {}, {}
@@ -398,6 +441,7 @@ if st.button("📡 啟動 V1.4.1 技術結構雷達", type="primary", use_contai
             if not s:
                 raise RuntimeError("無法計算完整技術指標")
             ts = technical_structure(x)
+            final_light, final_reason, final_zone = final_trade_decision(s, ts)
             rows.append({
                 "代號": sid, "品質分": s["品質分"], "級別": grade(s["品質分"]),
                 "進場分": s["進場分"], "狀態": s["狀態"], "收盤": s["收盤"],
@@ -407,7 +451,8 @@ if st.button("📡 啟動 V1.4.1 技術結構雷達", type="primary", use_contai
                 "左側觸發": ts["左側觸發"], "右側突破": ts["右側突破"],
                 "進場區下": ts["進場區下"], "進場區上": ts["進場區上"],
                 "結構停損": ts["結構停損"], "第一目標": ts["第一目標"],
-                "目標價": ts["目標價"], "風報比": ts["風報比"]
+                "目標價": ts["目標價"], "風報比": ts["風報比"],
+                "最終決策": final_light, "決策原因": final_reason
             })
             s["structure"] = ts
             details[sid] = s
@@ -437,6 +482,25 @@ if "radar_out" in st.session_state:
     show = st.session_state["radar_show"]
     details = st.session_state["radar_details"]
     datasets = st.session_state["radar_datasets"]
+
+    st.header("🚦 今日最終交易燈號")
+    st.caption("先看這裡：品質分、進場分、技術共振、量價、結構與風報比必須一起通過，才會列為綠燈。")
+
+    final_cols = ["代號","最終決策","決策原因","收盤","進場區下","進場區上","結構停損","第一目標","目標價","風報比"]
+    final_view = out[final_cols].copy()
+    priority = {"🟢 可進場候選":0, "🟡 等待突破":1, "🟡 等待轉強":2, "🔵 等待回測":3, "⚪ 觀察":4, "🔴 不進場":5}
+    final_view["_p"] = final_view["最終決策"].map(priority).fillna(9)
+    final_view = final_view.sort_values(["_p","風報比"], ascending=[True,False]).drop(columns="_p")
+    for c in ["收盤","進場區下","進場區上","結構停損","第一目標","目標價"]:
+        final_view[c] = final_view[c].map(lambda v: "-" if pd.isna(v) else f"{v:.2f}")
+    final_view["風報比"] = final_view["風報比"].map(lambda v: "-" if pd.isna(v) else f"1:{v:.2f}")
+    st.dataframe(final_view, use_container_width=True, hide_index=True)
+
+    green = out[out["最終決策"]=="🟢 可進場候選"]
+    if green.empty:
+        st.info("今天沒有綠燈候選。沒有符合條件時就等待，不為了交易而交易。")
+    else:
+        st.success(f"目前有 {len(green)} 檔綠燈候選；仍需以實際成交量與當下 K 線確認。")
 
     st.header("🏆 股票品質 × 進場排行榜")
     st.dataframe(show, use_container_width=True, hide_index=True)
@@ -468,10 +532,10 @@ if "radar_out" in st.session_state:
                 st.caption(f'回測觀察區：{ts["回測區下"]:.2f} ～ {ts["回測區上"]:.2f}')
             if pd.notna(ts["風報比"]):
                 st.write(f'**預估風報比：1 : {ts["風報比"]:.2f}**')
-            st.caption("V1.4.1 會區分『突破觸發價』與『目前可接受進場區』；已離突破點過遠會改為等待回測。價位仍為規則化研究值，需搭配成交量與實際K線確認。")
+            st.caption("V1.4.2 會區分『突破觸發價』與『目前可接受進場區』；已離突破點過遠會改為等待回測。價位仍為規則化研究值，需搭配成交量與實際K線確認。")
 
     st.header("🎯 現在的進場候選")
-    candidates = out[out["狀態"].isin(["🟢 突破候選","🟢 回測／均線買點候選","🟡 等待買點"])].copy()
+    candidates = out[out["最終決策"].isin(["🟢 可進場候選","🟡 等待突破","🟡 等待轉強","🔵 等待回測"])].copy()
     if candidates.empty:
         st.info("目前沒有通過條件的候選。雷達不強迫產生買點。")
     else:
@@ -532,4 +596,4 @@ if "radar_out" in st.session_state:
         st.caption(f'20日平均 MFE：{bt["MFE20"].mean():.2%}｜平均 MAE：{bt["MAE20"].mean():.2%}')
         st.download_button("下載歷史驗證 CSV", bt.to_csv(index=False).encode("utf-8-sig"), "v1_3_backtest.csv", "text/csv")
 
-st.caption("V1.4.1｜研究與策略驗證用途，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
+st.caption("V1.4.2｜研究與策略驗證用途，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
