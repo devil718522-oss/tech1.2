@@ -6,7 +6,7 @@ from datetime import date, timedelta
 
 st.set_page_config(page_title="家銘趨勢雷達 V1.4", page_icon="📡", layout="wide")
 st.title("📡 家銘趨勢雷達 V1.4")
-st.caption("技術面型態雷達｜品質 × 結構 × 價格觸發 × 量價 × 風報比")
+st.caption("技術面型態雷達｜品質分 × 進場分 × 追高風險 × 歷史驗證")
 
 API = "https://api.finmindtrade.com/api/v4/data"
 
@@ -219,8 +219,7 @@ def technical_structure(x):
     # 左側：回測10/20MA或上升切線後，以當日高點+0.2%作確認；右側：突破主要壓力
     pullback_zone_low=min([v for v in [r.MA10,r.MA20,up_line] if pd.notna(v)], default=np.nan)
     pullback_zone_high=max([v for v in [r.MA10,r.MA20,up_line] if pd.notna(v)], default=np.nan)
-    prev_bar_high=float(x.iloc[-2].High) if len(x)>=2 else np.nan
-    left_trigger=prev_bar_high*1.002 if trend=="多頭" and pd.notna(prev_bar_high) and pd.notna(pullback_zone_high) and r.Low<=pullback_zone_high*1.02 else np.nan
+    left_trigger=float(r.High)*1.002 if trend=="多頭" and pd.notna(pullback_zone_high) and r.Low<=pullback_zone_high*1.02 else np.nan
     right_trigger=breakout_trigger
 
     # 型態目標：ABC 等幅 AB 自 C 投射；否則20日箱體等幅
@@ -230,24 +229,10 @@ def technical_structure(x):
     elif pd.notna(r.PrevHH20) and pd.notna(r.PrevLL20):
         target=r.PrevHH20+(r.PrevHH20-r.PrevLL20); target_type="20日箱型等幅"
 
-    # 交易計畫：把「突破價」與「真正預定進場價」分開。
-    # 右側突破後，只允許在突破價上方 2% 內視為合理追價區；超過則等回測。
-    entry_low=np.nan; entry_high=np.nan; planned_entry=np.nan
-    first_target=np.nan; rr=np.nan
-    if pd.notna(right_trigger):
-        entry_low=float(right_trigger)
-        entry_high=float(right_trigger)*1.02
-        if r.Close < right_trigger:
-            planned_entry=float(right_trigger)
-        elif r.Close <= entry_high:
-            planned_entry=float(r.Close)
-        else:
-            planned_entry=float(right_trigger)*1.01
-
-    if pd.notna(planned_entry) and pd.notna(target) and target>planned_entry:
-        first_target=planned_entry + (target-planned_entry)*0.5
-    if pd.notna(planned_entry) and pd.notna(target) and planned_entry>structural_stop and target>planned_entry:
-        rr=(target-planned_entry)/(planned_entry-structural_stop)
+    chosen_entry = left_trigger if pd.notna(left_trigger) and left_trigger>=r.Close*0.98 else right_trigger
+    rr=np.nan
+    if pd.notna(chosen_entry) and pd.notna(target) and chosen_entry>structural_stop and target>chosen_entry:
+        rr=(target-chosen_entry)/(chosen_entry-structural_stop)
 
     resonance=0; reasons=[]
     for ok,msg in [
@@ -264,14 +249,12 @@ def technical_structure(x):
 
     if r.Close < structural_stop:
         status="🔴 結構失效"
-    elif pd.notna(right_trigger) and r.Close > right_trigger*1.02:
-        status="🔵 已突破／等待回測"
     elif pd.notna(right_trigger) and r.Close>=right_trigger:
-        status="🟢 突破後合理區"
+        status="🟢 右側突破已觸發"
     elif pd.notna(left_trigger) and r.Close>=left_trigger:
-        status="🟢 左側轉強"
+        status="🟢 左側轉強已觸發"
     elif trend=="多頭":
-        status="🟡 等待突破"
+        status="🟡 等待觸發"
     else:
         status="⚪ 結構未完成"
 
@@ -281,151 +264,9 @@ def technical_structure(x):
         "ABC":abc,"A":A,"B":B,"C":C,
         "回測區下":pullback_zone_low,"回測區上":pullback_zone_high,
         "左側觸發":left_trigger,"右側突破":right_trigger,
-        "進場區下":entry_low,"進場區上":entry_high,"預定進場":planned_entry,
-        "結構停損":structural_stop,"第一目標":first_target,
-        "目標價":target,"目標類型":target_type,
+        "結構停損":structural_stop,"目標價":target,"目標類型":target_type,
         "風報比":rr,"結構狀態":status
     }
-
-
-def final_trade_decision(s, ts):
-    """整合品質、共振、價格位置、量價與風報比，輸出唯一最終決策。"""
-    q=float(s["品質分"])
-    resonance=int(ts["共振"])
-    close=float(s["收盤"])
-    vr=float(s["量比"]) if pd.notna(s["量比"]) else 0.0
-    rt=ts["右側突破"]
-    stop=ts["結構停損"]
-    rr=ts["風報比"]
-
-    reasons=[]
-    # 先處理硬性排除
-    if close <= stop:
-        return "🔴 不進場", "結構已失效", reasons
-    if q < 65:
-        return "🔴 不進場", f"品質 {q:.0f} 分未達 65", reasons
-    if resonance < 5:
-        return "🔴 不進場", f"技術共振 {resonance}/8 未達 5/8", reasons
-    if pd.notna(rr) and rr < 1.5:
-        return "🔴 不進場", f"風報比僅 1:{rr:.2f}，低於 1:1.5", reasons
-
-    # 尚未突破：品質/結構夠好才進入等待名單
-    if pd.notna(rt) and close < rt:
-        if vr < 0.8:
-            reasons.append("目前量能偏弱")
-        return "🟡 等待突破", f"突破 {rt:.2f} 後再確認", reasons
-
-    # 已突破太遠：不追價
-    if pd.notna(rt) and close > rt*1.02:
-        return "🔵 等待回測", f"已高於突破價 2%，等回測 {rt:.2f}～{rt*1.02:.2f}", reasons
-
-    # 在合理突破區，仍要求量能不能太弱
-    if pd.notna(rt) and rt <= close <= rt*1.02:
-        if vr < 0.8:
-            return "🟡 等量確認", f"價格已到位，但量比 {vr:.2f} 偏弱", reasons
-        return "🟢 可進場", f"合理進場區 {rt:.2f}～{rt*1.02:.2f}", reasons
-
-    return "🟡 觀察", "尚未形成完整價格觸發", reasons
-
-
-
-def dual_entry_plan(x, s, ts):
-    """方向修正版：
-    A 回檔買一定在現價下方；B 突破買一定在現價上方才叫等待突破；
-    若關鍵區在現價上方但尚未形成有效突破，改稱 C 站回確認。
-    """
-    r=x.iloc[-1]
-    close=float(r.Close)
-    atr=float(r.ATR14) if "ATR14" in x.columns and pd.notna(r.ATR14) else max(close*0.02, 0.01)
-
-    # 收集支撐候選，只允許「現價下方」成為 A 回檔區。
-    raw_supports=[]
-    for v in [
-        r.MA5 if "MA5" in x.columns else np.nan,
-        r.MA10 if "MA10" in x.columns else np.nan,
-        r.MA20 if "MA20" in x.columns else np.nan,
-        r.MA60 if "MA60" in x.columns else np.nan,
-        ts.get("上升切線"),
-        ts.get("C"),
-        ts.get("回測區下"),
-        ts.get("回測區上")
-    ]:
-        if pd.notna(v) and float(v)>0:
-            raw_supports.append(float(v))
-
-    below=[v for v in raw_supports if v < close]
-    a_low=a_high=np.nan
-    if below:
-        base=max(below)  # 最近的下方有效支撐
-        lo=max(0.01, base-0.30*atr)
-        hi=min(close*0.998, base+0.20*atr)
-        if hi > lo and hi < close:
-            a_low, a_high=lo, hi
-
-    # 結構壓力 / 原右側突破。
-    structural_break=ts.get("右側突破")
-    if pd.isna(structural_break):
-        prevhh=float(r.PrevHH20) if "PrevHH20" in x.columns and pd.notna(r.PrevHH20) else np.nan
-        structural_break=prevhh*1.002 if pd.notna(prevhh) else np.nan
-
-    # B 只有「在現價上方」才叫突破買。
-    b_break=np.nan
-    if pd.notna(structural_break) and float(structural_break) > close:
-        b_break=float(structural_break)
-
-    # 若結構價已在現價下方，代表突破已發生，不再叫「等待突破」。
-    # C 站回確認：從現價上方的 MA/趨勢線/結構位找最近一個需要重新站回的位置。
-    reclaim_candidates=[]
-    for v in [
-        r.MA5 if "MA5" in x.columns else np.nan,
-        r.MA10 if "MA10" in x.columns else np.nan,
-        r.MA20 if "MA20" in x.columns else np.nan,
-        ts.get("下降切線"),
-        ts.get("回測區下"),
-        ts.get("回測區上")
-    ]:
-        if pd.notna(v) and float(v) > close:
-            reclaim_candidates.append(float(v))
-    c_reclaim=min(reclaim_candidates) if reclaim_candidates else np.nan
-
-    # 禁止追價基準：有 B 用 B，否則有 C 用 C；都沒有則用現價 + 2%。
-    trigger_ref = b_break if pd.notna(b_break) else (c_reclaim if pd.notna(c_reclaim) else close)
-    chase_limit=float(trigger_ref)*1.02
-
-    # 停損：以結構停損為主；若 A 存在，停損必須低於 A 區。
-    stop=float(ts.get("結構停損")) if pd.notna(ts.get("結構停損")) else close-atr
-    if pd.notna(a_low) and stop >= a_low:
-        stop=max(0.01, a_low-0.50*atr)
-
-    # 目標：沿用型態目標；不足時以主要觸發價做 2R 投影。
-    entry_ref = b_break if pd.notna(b_break) else (c_reclaim if pd.notna(c_reclaim) else close)
-    pattern_target=ts.get("目標價")
-    if pd.isna(pattern_target) or float(pattern_target) <= entry_ref:
-        pattern_target=entry_ref + 2.0*max(entry_ref-stop, atr)
-    pattern_target=float(pattern_target)
-    first_target=entry_ref + 0.5*(pattern_target-entry_ref)
-
-    # 各方案 RR
-    rr_a=np.nan
-    if pd.notna(a_low) and pd.notna(a_high):
-        amid=(a_low+a_high)/2
-        if amid>stop and pattern_target>amid:
-            rr_a=(pattern_target-amid)/(amid-stop)
-    rr_b=np.nan
-    if pd.notna(b_break) and b_break>stop and pattern_target>b_break:
-        rr_b=(pattern_target-b_break)/(b_break-stop)
-    rr_c=np.nan
-    if pd.notna(c_reclaim) and c_reclaim>stop and pattern_target>c_reclaim:
-        rr_c=(pattern_target-c_reclaim)/(c_reclaim-stop)
-
-    return {
-        "A回檔下":a_low, "A回檔上":a_high,
-        "B突破":b_break, "C站回":c_reclaim,
-        "禁止追價":chase_limit,
-        "計畫停損":stop, "第一目標2":first_target, "型態目標2":pattern_target,
-        "A風報比":rr_a, "B風報比":rr_b, "C風報比":rr_c
-    }
-
 
 def grade(v):
     return "S" if v >= 85 else "A" if v >= 75 else "B" if v >= 65 else "C"
@@ -470,7 +311,7 @@ else:
     raw = st.text_area("輸入股票代號｜一行一個", "2376\n3481\n2330", height=180)
     stocks = [s.strip() for s in raw.replace(",", "\n").splitlines() if s.strip().isdigit()]
 
-if st.button("📡 啟動 V1.5.1 買點方向修正版", type="primary", use_container_width=True):
+if st.button("📡 啟動 V1.6 自動選股雷達", type="primary", use_container_width=True):
     end = date.today()
     start = end - timedelta(days=history_days)
     rows, details, datasets = [], {}, {}
@@ -485,24 +326,14 @@ if st.button("📡 啟動 V1.5.1 買點方向修正版", type="primary", use_con
             if not s:
                 raise RuntimeError("無法計算完整技術指標")
             ts = technical_structure(x)
-            final_state, final_action, final_notes = final_trade_decision(s, ts)
-            plan = dual_entry_plan(x, s, ts)
             rows.append({
                 "代號": sid, "品質分": s["品質分"], "級別": grade(s["品質分"]),
                 "進場分": s["進場分"], "狀態": s["狀態"], "收盤": s["收盤"],
                 "量比": s["量比"], "RSI": s["RSI"], "5MA乖離": s["5MA乖離"],
                 "20日漲跌": s["20日漲跌"], "趨勢結構": ts["趨勢結構"],
                 "技術共振": ts["共振"], "結構狀態": ts["結構狀態"],
-                "最終決策": final_state, "現在該做": final_action,
                 "左側觸發": ts["左側觸發"], "右側突破": ts["右側突破"],
-                "進場區下": ts["進場區下"], "進場區上": ts["進場區上"],
-                "結構停損": ts["結構停損"], "第一目標": ts["第一目標"],
-                "目標價": ts["目標價"], "風報比": ts["風報比"],
-                "A回檔下": plan["A回檔下"], "A回檔上": plan["A回檔上"],
-                "B突破": plan["B突破"], "C站回": plan["C站回"], "禁止追價": plan["禁止追價"],
-                "計畫停損": plan["計畫停損"], "第一目標2": plan["第一目標2"],
-                "型態目標2": plan["型態目標2"],
-                "A風報比": plan["A風報比"], "B風報比": plan["B風報比"], "C風報比": plan["C風報比"]
+                "結構停損": ts["結構停損"], "目標價": ts["目標價"], "風報比": ts["風報比"]
             })
             s["structure"] = ts
             details[sid] = s
@@ -533,79 +364,53 @@ if "radar_out" in st.session_state:
     details = st.session_state["radar_details"]
     datasets = st.session_state["radar_datasets"]
 
-    st.header("🎯 明確進場價位")
-    st.caption("A 回檔買一定低於現價；B 突破買一定高於現價；若需要重新站回關鍵價，改列 C 站回確認。")
+    st.header("🏆 股票品質 × 進場排行榜")
+    st.dataframe(show, use_container_width=True, hide_index=True)
 
-    priority={"🟢 可進場":0,"🟡 等待突破":1,"🟡 等量確認":2,"🔵 等待回測":3,"🟡 觀察":4,"🔴 不進場":5}
-    cards=out.copy()
-    cards["_p"]=cards["最終決策"].map(priority).fillna(9)
-    cards=cards.sort_values(["_p","品質分","技術共振"],ascending=[True,False,False])
+    st.header("🧭 技術結構決策")
+    decision_cols=["代號","趨勢結構","技術共振","結構狀態","收盤","左側觸發","右側突破","結構停損","目標價","風報比"]
+    decision=out[decision_cols].copy()
+    for c in ["收盤","左側觸發","右側突破","結構停損","目標價"]:
+        decision[c]=decision[c].map(lambda v: "-" if pd.isna(v) else f"{v:.2f}")
+    decision["風報比"]=decision["風報比"].map(lambda v:"-" if pd.isna(v) else f"1:{v:.2f}")
+    st.dataframe(decision,use_container_width=True,hide_index=True)
 
-    for _,row in cards.head(15).iterrows():
-        sid=row["代號"]
-        decision=row["最終決策"]
+    st.subheader("📐 個股結構詳解")
+    for _,dr in out.sort_values(["技術共振","進場分"],ascending=False).head(8).iterrows():
+        sid=dr["代號"]; ts=details[sid]["structure"]
+        with st.expander(f'{sid}｜共振 {ts["共振"]}/8｜{ts["結構狀態"]}'):
+            st.write("**技術共振：** "+("、".join(ts["共振理由"]) or "尚未形成"))
+            if ts["ABC"]:
+                st.write(f'**ABC：** A {ts["A"]:.2f} → B {ts["B"]:.2f} → C {ts["C"]:.2f}')
+            c1,c2,c3,c4=st.columns(4)
+            c1.metric("左側觸發","-" if pd.isna(ts["左側觸發"]) else f'{ts["左側觸發"]:.2f}')
+            c2.metric("右側突破","-" if pd.isna(ts["右側突破"]) else f'{ts["右側突破"]:.2f}')
+            c3.metric("跌破退出","-" if pd.isna(ts["結構停損"]) else f'{ts["結構停損"]:.2f}')
+            c4.metric(ts["目標類型"],"-" if pd.isna(ts["目標價"]) else f'{ts["目標價"]:.2f}')
+            if pd.notna(ts["回測區下"]) and pd.notna(ts["回測區上"]):
+                st.caption(f'回測觀察區：{ts["回測區下"]:.2f} ～ {ts["回測區上"]:.2f}')
+            if pd.notna(ts["風報比"]):
+                st.write(f'**預估風報比：1 : {ts["風報比"]:.2f}**')
+            st.caption("左側觸發、突破、停損與目標價皆為規則化技術結構研究值，需搭配成交量與實際K線確認。")
 
-        if decision=="🟢 可進場":
-            verdict="🟢 條件通過"
-        elif decision=="🔴 不進場":
-            verdict="🔴 現在不買"
-        elif decision=="🔵 等待回測":
-            verdict="🔵 不追，等回檔"
-        else:
-            verdict="🟡 現在先等"
-
-        with st.container(border=True):
-            st.subheader(f"{sid}｜{verdict}")
-            st.markdown(f'### 現價：**{row["收盤"]:.2f} 元**')
-
-            if pd.notna(row["A回檔下"]) and pd.notna(row["A回檔上"]):
-                st.markdown(f'### A｜回檔買：**{row["A回檔下"]:.2f} ～ {row["A回檔上"]:.2f} 元**')
-            else:
-                st.markdown("### A｜回檔買：**目前沒有現價下方的有效回檔區**")
-
-            if pd.notna(row["B突破"]):
-                st.markdown(f'### B｜突破買：**突破 {row["B突破"]:.2f} 元＋量能確認**')
-            else:
-                st.markdown("### B｜突破買：**目前沒有新的上方突破價**")
-
-            if pd.notna(row["C站回"]):
-                st.markdown(f'### C｜站回確認：**重新站上 {row["C站回"]:.2f} 元再評估**')
-
-            st.write(f'**禁止追價：超過 {row["禁止追價"]:.2f} 元不追**')
-
-            a,b,c,d=st.columns(4)
-            a.metric("停損",f'{row["計畫停損"]:.2f}')
-            b.metric("第一目標",f'{row["第一目標2"]:.2f}')
-            c.metric("型態目標",f'{row["型態目標2"]:.2f}')
-            d.metric("量比",f'{row["量比"]:.2f}')
-
-            if decision=="🔴 不進場":
-                st.error(f'目前不買原因：{row["現在該做"]}。A/B/C 價位只作下一次技術觀察。')
-            elif decision=="🔵 等待回測" and pd.notna(row["A回檔下"]):
-                st.info(f'不要追價；優先等 A 區 {row["A回檔下"]:.2f}～{row["A回檔上"]:.2f}。')
-            elif pd.notna(row["B突破"]):
-                st.warning(f'目前先等；若走強，觀察突破 {row["B突破"]:.2f} 元且量能確認。')
-            elif pd.notna(row["C站回"]):
-                st.warning(f'目前先等；先重新站回 {row["C站回"]:.2f} 元再評估。')
-
-            st.caption(
-                f'品質 {row["品質分"]:.0f}/100｜共振 {row["技術共振"]}/8｜'
-                f'A RR {"-" if pd.isna(row["A風報比"]) else f"1:{row["A風報比"]:.2f}"}｜'
-                f'B RR {"-" if pd.isna(row["B風報比"]) else f"1:{row["B風報比"]:.2f}"}｜'
-                f'C RR {"-" if pd.isna(row["C風報比"]) else f"1:{row["C風報比"]:.2f}"}'
-            )
-
-    with st.expander("🔎 技術細節"):
-        detail_cols=["代號","最終決策","收盤","品質分","技術共振","量比",
-                     "A回檔下","A回檔上","B突破","C站回","禁止追價","計畫停損",
-                     "第一目標2","型態目標2","A風報比","B風報比","C風報比"]
-        detail=out[detail_cols].copy()
-        for c in ["收盤","A回檔下","A回檔上","B突破","C站回","禁止追價","計畫停損","第一目標2","型態目標2"]:
-            detail[c]=detail[c].map(lambda v:"-" if pd.isna(v) else f"{v:.2f}")
-        detail["量比"]=detail["量比"].map(lambda v:"-" if pd.isna(v) else f"{v:.2f}")
-        for c in ["A風報比","B風報比","C風報比"]:
-            detail[c]=detail[c].map(lambda v:"-" if pd.isna(v) else f"1:{v:.2f}")
-        st.dataframe(detail,use_container_width=True,hide_index=True)
+    st.header("🎯 現在的進場候選")
+    candidates = out[out["狀態"].isin(["🟢 突破候選","🟢 回測／均線買點候選","🟡 等待買點"])].copy()
+    if candidates.empty:
+        st.info("目前沒有通過條件的候選。雷達不強迫產生買點。")
+    else:
+        for _, row in candidates.head(10).iterrows():
+            sid = row["代號"]
+            s = details[sid]
+            with st.expander(f'{sid}｜品質 {s["品質分"]}/100｜進場 {s["進場分"]}/100｜{s["狀態"]}'):
+                c1,c2,c3,c4 = st.columns(4)
+                c1.metric("收盤", f'{s["收盤"]:.2f}')
+                c2.metric("量比", f'{s["量比"]:.2f}')
+                c3.metric("20日壓力", f'{s["20日壓力"]:.2f}' if pd.notna(s["20日壓力"]) else "-")
+                c4.metric("參考防守", f'{s["參考防守"]:.2f}' if pd.notna(s["參考防守"]) else "-")
+                st.write("**品質成立：** " + ("、".join(s["品質理由"]) or "無"))
+                st.write("**進場加分：** " + ("、".join(s["進場理由"]) or "無"))
+                if s["風險"]:
+                    st.warning("追高／結構風險：" + "、".join(s["風險"]))
 
     st.divider()
     st.header("🧪 歷史驗證｜不偷看未來")
@@ -651,3 +456,144 @@ if "radar_out" in st.session_state:
         st.download_button("下載歷史驗證 CSV", bt.to_csv(index=False).encode("utf-8-sig"), "v1_3_backtest.csv", "text/csv")
 
 st.caption("V1.4｜研究與策略驗證用途，不構成投資建議。參考防守為技術結構提示，不是個人化停損建議。")
+
+
+# ============================================================
+# V1.6 全市場自動選股雷達
+# ============================================================
+st.divider()
+st.header("🤖 V1.6｜自動選股雷達")
+st.caption("自動取得上市櫃股票名單 → 快速篩選 → 完整技術分析。為避免 API 額度與手機逾時，採兩階段掃描。")
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def v16_stock_universe():
+    url="https://api.finmindtrade.com/api/v4/data"
+    resp=requests.get(url,params={"dataset":"TaiwanStockInfo"},timeout=30)
+    resp.raise_for_status()
+    js=resp.json()
+    if not js.get("data"):
+        return pd.DataFrame()
+    d=pd.DataFrame(js["data"])
+    d["date"]=pd.to_datetime(d["date"],errors="coerce")
+    d=d.sort_values("date").groupby("stock_id",as_index=False).tail(1)
+    d=d[d["type"].isin(["twse","tpex"])].copy()
+    d["stock_id"]=d["stock_id"].astype(str)
+    d=d[d["stock_id"].str.fullmatch(r"\d{4}",na=False)]
+    d=d[~d["industry_category"].isin(["ETF","ETN","Index","大盤","所有證券"])]
+    return d[["stock_id","stock_name","industry_category","type"]].drop_duplicates("stock_id")
+
+def v16_plan(x,s,ts):
+    r=x.iloc[-1]; close=float(r.Close)
+    atr=float(r.ATR14) if "ATR14" in x.columns and pd.notna(r.ATR14) else close*0.02
+    # A 回檔買：只准在現價下方
+    vals=[]
+    for v in [r.MA5,r.MA10,r.MA20,r.MA60,ts.get("上升切線"),ts.get("C")]:
+        if pd.notna(v) and 0<float(v)<close:
+            vals.append(float(v))
+    if vals:
+        b=max(vals); a1=max(0.01,b-0.30*atr); a2=min(close*0.998,b+0.20*atr)
+        if a2<=a1: a1=a2=np.nan
+    else: a1=a2=np.nan
+    # B 突破買：只准在現價上方
+    br=ts.get("右側突破")
+    br=float(br) if pd.notna(br) and float(br)>close else np.nan
+    # C 站回：上方最近均線/下降線
+    rc=[]
+    for v in [r.MA5,r.MA10,r.MA20,ts.get("下降切線")]:
+        if pd.notna(v) and float(v)>close: rc.append(float(v))
+    reclaim=min(rc) if rc else np.nan
+    ref=br if pd.notna(br) else (reclaim if pd.notna(reclaim) else close)
+    stop=float(ts["結構停損"]) if pd.notna(ts["結構停損"]) else close-atr
+    if pd.notna(a1) and stop>=a1: stop=max(0.01,a1-0.5*atr)
+    tgt=float(ts["目標價"]) if pd.notna(ts["目標價"]) and float(ts["目標價"])>ref else ref+2*max(ref-stop,atr)
+    t1=ref+(tgt-ref)*0.5
+    return a1,a2,br,reclaim,ref*1.02,stop,t1,tgt
+
+def v16_quick(sid,min_price,max_price,min_vol):
+    end=pd.Timestamp.today().normalize()
+    start=end-pd.Timedelta(days=120)
+    d=api_get("TaiwanStockPrice",sid,start.strftime("%Y-%m-%d"),end.strftime("%Y-%m-%d"))
+    if d.empty or len(d)<65: return None
+    x=prep(d)
+    if x.empty: return None
+    r=x.iloc[-1]; close=float(r.Close)
+    av=float(x.Volume.tail(20).mean())
+    if close<min_price or close>max_price or av<min_vol: return None
+    q=0
+    if close>r.MA20: q+=2
+    if close>r.MA60: q+=2
+    if r.MA5>r.MA10: q+=1
+    if r.MA10>r.MA20: q+=1
+    if r.VolumeRatio>=1: q+=1
+    if close>=r.PrevHH20*0.97: q+=1
+    return (sid,q,float(r.VolumeRatio),av)
+
+with st.expander("⚙️ 自動選股設定",expanded=False):
+    v16_minp=st.number_input("最低股價",1.0,1000.0,10.0,1.0,key="v16minp")
+    v16_maxp=st.number_input("最高股價",10.0,5000.0,800.0,10.0,key="v16maxp")
+    v16_minv=st.number_input("20日平均成交量至少（張）",0,100000,1000,500,key="v16minv")
+    v16_exfin=st.checkbox("排除金融保險",True,key="v16fin")
+    v16_seed=st.slider("第一階段掃描檔數",40,200,120,20,key="v16seed")
+    v16_full=st.slider("進入完整分析檔數",10,60,30,5,key="v16full")
+
+if st.button("🚀 啟動全市場自動選股",type="primary",use_container_width=True,key="v16go"):
+    try:
+        uni=v16_stock_universe()
+        if v16_exfin:
+            uni=uni[~uni.industry_category.astype(str).str.contains("金融|保險",regex=True,na=False)]
+        # 每次從完整 universe 均勻抽取，避免永遠只掃代號前段。
+        ids=uni.stock_id.tolist()
+        if len(ids)>v16_seed:
+            step=max(len(ids)//v16_seed,1)
+            ids=ids[::step][:v16_seed]
+        st.write(f"第一階段掃描：{len(ids)} 檔")
+        q=[]; bar=st.progress(0)
+        for i,sid in enumerate(ids):
+            try:
+                z=v16_quick(sid,v16_minp,v16_maxp,v16_minv)
+                if z: q.append(z)
+            except Exception:
+                pass
+            bar.progress((i+1)/max(len(ids),1))
+        bar.empty()
+        if not q:
+            st.warning("目前沒有快篩候選；可能條件太嚴、API 額度不足或資料尚未更新。")
+        else:
+            q=sorted(q,key=lambda z:(z[1],z[2],z[3]),reverse=True)[:v16_full]
+            results=[]; bar2=st.progress(0)
+            end=pd.Timestamp.today().normalize()
+            start=end-pd.Timedelta(days=420)
+            for i,(sid,qs,vr,av) in enumerate(q):
+                try:
+                    d=api_get("TaiwanStockPrice",sid,start.strftime("%Y-%m-%d"),end.strftime("%Y-%m-%d"))
+                    x=prep(d)
+                    s=score_latest(x)
+                    ts=technical_structure(x)
+                    a1,a2,br,rc,chase,stop,t1,tgt=v16_plan(x,s,ts)
+                    results.append({
+                        "代號":sid,"品質分":s["品質分"],"進場分":s["進場分"],
+                        "趨勢":ts["趨勢結構"],"共振":ts["共振"],"現價":s["收盤"],"量比":s["量比"],
+                        "A回檔下":a1,"A回檔上":a2,"B突破":br,"C站回":rc,
+                        "禁止追價":chase,"停損":stop,"第一目標":t1,"型態目標":tgt
+                    })
+                except Exception:
+                    pass
+                bar2.progress((i+1)/max(len(q),1))
+            bar2.empty()
+            if results:
+                rr=pd.DataFrame(results).sort_values(["品質分","共振","進場分"],ascending=False).reset_index(drop=True)
+                st.success(f"完成：找到 {len(rr)} 檔完整候選")
+                tabs=st.tabs(["🔥 今日最佳","↩️ 回檔雷達","🚀 突破雷達","📋 全部候選"])
+                with tabs[0]:
+                    st.dataframe(rr.head(10),use_container_width=True,hide_index=True)
+                with tabs[1]:
+                    st.dataframe(rr[rr["A回檔下"].notna()].head(15),use_container_width=True,hide_index=True)
+                with tabs[2]:
+                    st.dataframe(rr[rr["B突破"].notna()].head(15),use_container_width=True,hide_index=True)
+                with tabs[3]:
+                    st.dataframe(rr,use_container_width=True,hide_index=True)
+            else:
+                st.warning("快篩有候選，但完整分析未成功取得資料。")
+    except Exception as e:
+        st.error(f"自動選股啟動失敗：{e}")
+        st.caption("若是 API 額度問題，稍後再試或使用 FinMind token。")
